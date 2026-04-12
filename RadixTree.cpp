@@ -28,6 +28,7 @@ std::vector<std::string_view> split_and_reverse(std::string_view domain)
 void RadixTree::insert(const std::string &domain)
 {
     string_storage.push_back(domain);
+    // TODO 能不能预先分配好labels的空间？避免热路径上每次都需要创建动态对象
     std::vector<std::string_view> labels  = split_and_reverse(string_storage.back());
     TrieNode                     *current = root.get();
 

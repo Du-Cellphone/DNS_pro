@@ -5,6 +5,10 @@
 #include <random>
 #include <cstring>
 #include <nmmintrin.h> // SSE4.2 硬件指令集头文件
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
+
 
 // 模拟你原始代码中的常量
 const size_t MAX_DOMAIN_LEN = 256;
@@ -115,7 +119,20 @@ int main()
     std::chrono::duration<double, std::milli> diff2 = end - start;
     std::cout << "Hardware CRC32:      " << diff2.count() << " ms (crc_sum: " << sum2 << ")" << std::endl;
 
-    std::cout << "\nhardware speed ratio: " << diff1.count() / diff2.count() << "x" << std::endl;
+    // 测试 XXH3_64
+    start       = std::chrono::high_resolution_clock::now();
+    size_t sum3 = 0;
+    for (const auto &d : test_domains)
+    {
+        sum3 += XXH3_64bits(reinterpret_cast<const unsigned char *>(d.data()), d.size());
+    }
+    end                                             = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> diff3 = end - start;
+    std::cout << "XXH3_64:             " << diff3.count() << " ms (crc_sum: " << sum3 << ")" << std::endl;
+
+    std::cout << "\n CRC32 vs MurmurHash speed ratio: " << diff1.count() / diff2.count() << "x" << std::endl;
+    std::cout << " XXH3_64 vs MurmurHash speed ratio: " << diff1.count() / diff3.count() << "x" << std::endl;
+    std::cout << " XXH3_64 vs CRC32 speed ratio: " << diff2.count() / diff3.count() << "x" << std::endl;
 
     return 0;
 }
