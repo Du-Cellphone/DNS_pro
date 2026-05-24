@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include "HashUtils.hpp"
 
 
 namespace Filter

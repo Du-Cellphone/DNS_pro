@@ -113,118 +113,128 @@
 //     return 0;
 // }
 
-#include <atomic>
-#include <thread>
-#include <vector>
-#include <string>
-#include <iostream>
-#include <chrono>
+// #include <atomic>
+// #include <thread>
+// #include <vector>
+// #include <string>
+// #include <iostream>
+// #include <chrono>
 
-class CuckooFilter
-{
-public:
-    bool might_contain(const std::string &domain) const { return true; }
-};
+// class CuckooFilter
+// {
+// public:
+//     bool might_contain(const std::string &domain) const { return true; }
+// };
 
-class RadixTree
-{
-public:
-    bool search(const std::string &domain) const { return false; }
-};
+// class RadixTree
+// {
+// public:
+//     bool search(const std::string &domain) const { return false; }
+// };
 
-struct FilterContext
-{
-    CuckooFilter *cuckoo;
-    RadixTree    *tree;
+// struct FilterContext
+// {
+//     CuckooFilter *cuckoo;
+//     RadixTree    *tree;
 
-    FilterContext()
-        : cuckoo(new CuckooFilter())
-        , tree(new RadixTree())
-    {
-    }
-    ~FilterContext()
-    {
-        delete cuckoo;
-        delete tree;
-    }
-};
+//     FilterContext()
+//         : cuckoo(new CuckooFilter())
+//         , tree(new RadixTree())
+//     {
+//     }
+//     ~FilterContext()
+//     {
+//         delete cuckoo;
+//         delete tree;
+//     }
+// };
 
 
-std::atomic<FilterContext *> g_active_context{nullptr};
-std::atomic<bool>            g_running{true};
+// std::atomic<FilterContext *> g_active_context{nullptr};
+// std::atomic<bool>            g_running{true};
 
-void worker_thread(int worker_id)
-{
-    uint64_t request_count = 0;
-    // 首次获取当前激活的名单
-    FilterContext *local_ctx = g_active_context.load(std::memory_order_acquire);
+// void worker_thread(int worker_id)
+// {
+//     uint64_t request_count = 0;
+//     // 首次获取当前激活的名单
+//     FilterContext *local_ctx = g_active_context.load(std::memory_order_acquire);
 
-    while (g_running.load(std::memory_order_relaxed))
-    {
-        std::string req_domain = "example.com"; // 模拟请求域名
+//     while (g_running.load(std::memory_order_relaxed))
+//     {
+//         std::string req_domain = "example.com"; // 模拟请求域名
 
-        if (++request_count % 1024 == 0)
-        {
-            FilterContext *latest = g_active_context.load(std::memory_order_acquire);
-            if (latest != local_ctx)
-            {
-                local_ctx = latest;
-            }
-        }
+//         if (++request_count % 1024 == 0)
+//         {
+//             FilterContext *latest = g_active_context.load(std::memory_order_acquire);
+//             if (latest != local_ctx)
+//             {
+//                 local_ctx = latest;
+//             }
+//         }
 
-        if (local_ctx != nullptr && local_ctx->cuckoo->might_contain(req_domain))
-        {
-            if (local_ctx->tree->search(req_domain))
-            {
-                // 命中黑名单，执行拦截逻辑
-            }
-        }
-    }
-}
+//         if (local_ctx != nullptr && local_ctx->cuckoo->might_contain(req_domain))
+//         {
+//             if (local_ctx->tree->search(req_domain))
+//             {
+//                 // 命中黑名单，执行拦截逻辑
+//             }
+//         }
+//     }
+// }
 
-void manager_thread()
-{
-    while (g_running.load(std::memory_order_relaxed))
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(5)); // 模拟每5秒更新一次名单
-        std::cout << "[Manager] Updating filter context...\n";
+// void manager_thread()
+// {
+//     while (g_running.load(std::memory_order_relaxed))
+//     {
+//         std::this_thread::sleep_for(std::chrono::seconds(5)); // 模拟每5秒更新一次名单
+//         std::cout << "[Manager] Updating filter context...\n";
 
-        FilterContext *new_ctx = new FilterContext();
+//         FilterContext *new_ctx = new FilterContext();
 
-        FilterContext *old_ctx = g_active_context.exchange(new_ctx, std::memory_order_acq_rel);
+//         FilterContext *old_ctx = g_active_context.exchange(new_ctx, std::memory_order_acq_rel);
 
-        if (old_ctx != nullptr)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            delete old_ctx;
-            std::cout << "[Manager] Old context deleted.\n";
-        }
-    }
-}
+//         if (old_ctx != nullptr)
+//         {
+//             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+//             delete old_ctx;
+//             std::cout << "[Manager] Old context deleted.\n";
+//         }
+//     }
+// }
+
+// int main()
+// {
+//     g_active_context.store(new FilterContext(), std::memory_order_release);
+
+//     std::thread manager(manager_thread);
+
+//     std::vector<std::thread> workers;
+//     for (int i = 0; i < 15; ++i)
+//     {
+//         workers.emplace_back(worker_thread, i);
+//     }
+
+//     std::cout << "DNS filter running. Press Enter to stop...\n";
+//     std::cin.get();
+
+//     g_running.store(false, std::memory_order_relaxed);
+//     manager.join();
+//     for (auto &w : workers)
+//     {
+//         w.join();
+//     }
+
+//     delete g_active_context.load();
+//     std::cout << "DNS filter stopped.\n";
+//     return 0;
+// }
+
+#include "DNS.h"
 
 int main()
 {
-    g_active_context.store(new FilterContext(), std::memory_order_release);
-
-    std::thread manager(manager_thread);
-
-    std::vector<std::thread> workers;
-    for (int i = 0; i < 15; ++i)
-    {
-        workers.emplace_back(worker_thread, i);
-    }
-
-    std::cout << "DNS filter running. Press Enter to stop...\n";
-    std::cin.get();
-
-    g_running.store(false, std::memory_order_relaxed);
-    manager.join();
-    for (auto &w : workers)
-    {
-        w.join();
-    }
-
-    delete g_active_context.load();
-    std::cout << "DNS filter stopped.\n";
+    DNS dns;
+    dns.init(15, 1);
+    dns.start();
     return 0;
 }

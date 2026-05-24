@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(DNS)
 
-target_sources(DNS PUBLIC main.cpp DNS_Cache.cpp)
+target_sources(DNS PUBLIC DNS.cpp main.cpp DNS_Cache.cpp CuckooFilter.cpp)
 
 add_executable(filter_trie_benchmark)
 

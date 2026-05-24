@@ -11,16 +11,15 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <windows.h>
 #include "HashUtils.hpp"
 
 namespace Cache
 {
 
-inline constexpr size_t               TABLE_SIZE     = 1'000'000;
-inline constexpr size_t               MAX_DOMAIN_LEN = 256;
-inline const size_t                   SHARD_CNT      = std::thread::hardware_concurrency();
-inline constexpr size_t               CACHE_LINE     = std::hardware_destructive_interference_size;
+inline constexpr size_t TABLE_SIZE     = 1'000'000;
+inline constexpr size_t MAX_DOMAIN_LEN = 256;
+// inline const size_t                   SHARD_CNT      = std::thread::hardware_concurrency();
+// inline constexpr size_t               CACHE_LINE     = std::hardware_destructive_interference_size;
 inline constexpr std::chrono::seconds DEFAULT_TTL{300};
 
 
@@ -85,12 +84,13 @@ struct CacheEntry
 class DNS_Cache final
 {
 public:
-    DNS_Cache();
+    DNS_Cache(size_t shard_cnt);
     void                     initialize_thread_shard(int id);
     std::optional<IPAddress> get(const std::string &domain, const TimePoint &now);
     void                     put(const std::string &domain, const IPAddress &ip, const TimePoint &now);
 
 private:
+    size_t shard_count{0};
     struct CacheShard
     {
         std::vector<CacheEntry> entries;

@@ -10,9 +10,10 @@ namespace Cache
 
 thread_local int my_shard_id = -1;
 
-DNS_Cache::DNS_Cache()
+DNS_Cache::DNS_Cache(size_t shard_cnt)
 {
-    for (size_t i = 0; i < SHARD_CNT; ++i)
+    shard_count = shard_cnt;
+    for (size_t i = 0; i < shard_count; ++i)
     {
         cache_shards.emplace_back(new CacheShard);
     }
@@ -21,7 +22,7 @@ DNS_Cache::DNS_Cache()
 
 void DNS_Cache::initialize_thread_shard(int id)
 {
-    my_shard_id = id % SHARD_CNT;
+    my_shard_id = id % shard_count;
 }
 
 

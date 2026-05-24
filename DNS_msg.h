@@ -2,7 +2,6 @@
 #include <memory>
 #include <string>
 #include <cstddef>
-#include <winscard.h>
 
 constexpr size_t UDP_MAX = 512;
 
@@ -35,14 +34,14 @@ struct DNS_Header
 {
     unsigned short id;
 
-    byte qr : 1;
-    byte opcode : 4;
-    byte aa : 1;
-    byte tc : 1;
-    byte rd : 1;
-    byte ra : 1;
-    byte z : 3;
-    byte rcode : 4;
+    std::byte qr : 1;
+    std::byte opcode : 4;
+    std::byte aa : 1;
+    std::byte tc : 1;
+    std::byte rd : 1;
+    std::byte ra : 1;
+    std::byte z : 3;
+    std::byte rcode : 4;
 
     unsigned short qdcount;
     unsigned short ancount;

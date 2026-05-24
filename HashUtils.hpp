@@ -7,7 +7,7 @@
 #include <nmmintrin.h>
 #include <string_view>
 #define XXH_INLINE_ALL
-#include <xxhash.h>
+#include "xxhash.h"
 
 
 struct DomainHash
