@@ -1,6 +1,7 @@
 #include "DNS.h"
 #include "DNS_Cache.h"
 #include "WorkerContext.h"
+
 #include <cerrno>
 #include <cstring>
 #include <memory>
@@ -47,8 +48,8 @@ void DNS::worker()
 
     std::cout << "[Worker] 线程网络句柄初始化完毕，无锁监听中..." << std::endl;
 
-    struct epoll_event events[64];
-    uint8_t            buffer[1024];
+    epoll_event events[64];
+    uint8_t     buffer[1024];
 
     while (true)
     {
@@ -65,10 +66,10 @@ void DNS::worker()
 
             while (true)
             {
-                struct sockaddr_in client_addr{};
-                socklen_t          client_len = sizeof(client_addr);
+                sockaddr_in client_addr{};
+                socklen_t   client_len = sizeof(client_addr);
 
-                ssize_t bytes_recvd = ::recvfrom(ctx.listen_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
+                ssize_t bytes_recvd = ::recvfrom(ctx.listen_fd, buffer, sizeof(buffer), 0, (sockaddr *)&client_addr, &client_len);
 
                 if (bytes_recvd < 0)
                 {
@@ -102,13 +103,12 @@ bool DNS::init_network_env(WorkerContext &ctx, uint16_t port)
         return false;
     }
 
-    struct sockaddr_in addr{};
-    std::memset(&addr, 0, sizeof(addr));
+    sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port);
 
-    if (::bind(ctx.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    if (::bind(ctx.listen_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
         std::cerr << "failed to bind port " << strerror(errno) << std::endl;
         return false;
@@ -121,7 +121,7 @@ bool DNS::init_network_env(WorkerContext &ctx, uint16_t port)
         return false;
     }
 
-    struct epoll_event ev{};
+    epoll_event ev{};
     ev.events  = EPOLLIN | EPOLLET;
     ev.data.fd = ctx.listen_fd;
 

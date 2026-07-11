@@ -7,8 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
-#include <new>
-#include <thread>
+#include <sys/socket.h>
 #include <unordered_map>
 #include <vector>
 #include "HashUtils.hpp"
@@ -29,10 +28,17 @@ using TimePoint  = std::chrono::high_resolution_clock::time_point;
 
 struct IPAddress
 {
-    std::array<uint8_t, 16> ip;
-    uint8_t                 len;
+    std::array<uint8_t, 16> bytes{};
+    sa_family_t             family = AF_UNSPEC;
 
-    bool operator==(const IPAddress &other) const noexcept { return len == other.len && ip == other.ip; }
+    [[nodiscard]] bool is_v4() const noexcept { return family == AF_INET; }
+    [[nodiscard]] bool is_v6() const noexcept { return family == AF_INET6; }
+
+    IPAddress(const IPAddress &)            = default;
+    IPAddress(IPAddress &&)                 = default;
+    IPAddress &operator=(const IPAddress &) = default;
+    IPAddress &operator=(IPAddress &&)      = default;
+    bool       operator==(const IPAddress &other) const noexcept { return family == other.family && bytes == other.bytes; }
 };
 
 struct CacheEntry
@@ -42,7 +48,6 @@ struct CacheEntry
     TimePoint   expiry;
     bool        chance{true};
 
-    CacheEntry() = default;
 
     CacheEntry(std::string d, IPAddress i, TimePoint e)
         : domain(d)
