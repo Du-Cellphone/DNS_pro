@@ -1,30 +1,65 @@
 cmake_minimum_required(VERSION 3.23)
-project(DNS_pro)
+
+project(DNS_pro LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(DNS)
+option(DNS_PRO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-target_sources(DNS PUBLIC DNS.cpp main.cpp DNS_Cache.cpp CuckooFilter.cpp)
+find_package(Threads REQUIRED)
+include(CTest)
 
-add_executable(filter_trie_benchmark)
+function(dns_pro_set_warnings target)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    elseif(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    endif()
+endfunction()
 
-target_sources(filter_trie_benchmark PRIVATE
-    tests/filter_trie_benchmark.cpp
+function(dns_pro_enable_sanitizers target)
+    if(NOT DNS_PRO_ENABLE_SANITIZERS)
+        return()
+    endif()
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    else()
+        message(WARNING "DNS_PRO_ENABLE_SANITIZERS is only configured for GCC and Clang")
+    endif()
+endfunction()
+
+add_library(dns_core STATIC
+    DNS.cpp
+    DNS_Cache.cpp
     CuckooFilter.cpp
     RadixTree.cpp
 )
 
-target_compile_features(filter_trie_benchmark PRIVATE cxx_std_23)
+target_include_directories(dns_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(dns_core PUBLIC cxx_std_23)
+target_link_libraries(dns_core PUBLIC Threads::Threads)
+dns_pro_set_warnings(dns_core)
+dns_pro_enable_sanitizers(dns_core)
 
-if (CMAKE_SYSTEM_NAME MATCHES "Windows")
-    target_link_libraries(DNS PRIVATE -lstdc++exp)
-    target_compile_options(DNS PRIVATE -fcoroutines)
-    target_compile_options(DNS PRIVATE -msse4.2)
-    target_compile_options(DNS PRIVATE -lpthread)
-    target_compile_options(filter_trie_benchmark PRIVATE -msse4.2)
-    target_compile_options(filter_trie_benchmark PRIVATE -march=native)
-    target_compile_options(filter_trie_benchmark PRIVATE -O2)
+add_executable(DNS main.cpp)
+target_link_libraries(DNS PRIVATE dns_core)
+dns_pro_set_warnings(DNS)
+dns_pro_enable_sanitizers(DNS)
+
+add_executable(filter_trie_benchmark tests/filter_trie_benchmark.cpp)
+target_link_libraries(filter_trie_benchmark PRIVATE dns_core)
+dns_pro_set_warnings(filter_trie_benchmark)
+dns_pro_enable_sanitizers(filter_trie_benchmark)
+
+if(BUILD_TESTING)
+    add_executable(dns_component_tests tests/component_tests.cpp)
+    target_link_libraries(dns_component_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_component_tests)
+    dns_pro_enable_sanitizers(dns_component_tests)
+
+    add_test(NAME dns_component_tests COMMAND dns_component_tests)
 endif()
