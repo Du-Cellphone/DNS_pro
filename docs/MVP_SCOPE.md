@@ -13,7 +13,8 @@ DNS_PRO 第一版是运行在 Linux 上的过滤型 DNS 转发器，不是权威
 - 下游客户端通过 UDP 查询。
 - 通过 UDP 向一个可配置的上游 DNS 服务器转发查询。
 - 支持 `A` 和 `AAAA` 查询的解析、过滤、转发及正缓存。
-- 无法解析的报文返回 `FORMERR`。
+- 无法解析但至少包含 transaction ID 的查询报文返回 `FORMERR`；更短的报文直接丢弃。
+- 格式合法但 MVP 不支持的 opcode、QTYPE、QCLASS 或扩展返回 `NOTIMP`。
 - 上游超时或网络失败返回 `SERVFAIL`。
 - 命中过滤规则时返回 `REFUSED`，并保留客户端 transaction ID 和原始 question。
 - 服务支持显式启动、停止和等待退出；停止时取消尚未完成的上游查询。

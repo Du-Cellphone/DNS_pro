@@ -36,6 +36,10 @@ add_library(dns_core STATIC
     DNS.cpp
     DNS_Cache.cpp
     CuckooFilter.cpp
+    protocol/DnsParser.cpp
+    protocol/DnsQuery.cpp
+    protocol/DnsWriter.cpp
+    protocol/DomainName.cpp
     RadixTree.cpp
 )
 
@@ -62,4 +66,13 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_component_tests)
 
     add_test(NAME dns_component_tests COMMAND dns_component_tests)
+    set_tests_properties(dns_component_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_protocol_tests tests/protocol_tests.cpp)
+    target_link_libraries(dns_protocol_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_protocol_tests)
+    dns_pro_enable_sanitizers(dns_protocol_tests)
+
+    add_test(NAME dns_protocol_tests COMMAND dns_protocol_tests)
+    set_tests_properties(dns_protocol_tests PROPERTIES TIMEOUT 10)
 endif()
