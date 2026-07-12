@@ -3,7 +3,6 @@
 #include "protocol/DnsMessage.h"
 
 #include <cstddef>
-#include <expected>
 #include <span>
 
 namespace dns::protocol
@@ -47,7 +46,7 @@ struct ParseLimits
     bool   reject_trailing_data{true};
 };
 
-using ParseResult = std::expected<Message, ParseError>;
+using ParseResult = Expected<Message, ParseError>;
 
 ParseResult parse_message(std::span<const std::byte> packet, const ParseLimits &limits = {});
 

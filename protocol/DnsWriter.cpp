@@ -10,12 +10,12 @@ namespace dns::protocol
 namespace
 {
 
-std::unexpected<WriteError> write_failure(WriteErrorCode code)
+Unexpected<WriteError> write_failure(WriteErrorCode code)
 {
-    return std::unexpected(WriteError{code});
+    return dns::unexpected(WriteError{code});
 }
 
-std::expected<uint16_t, WriteError> encode_flags(const Header &header)
+Expected<uint16_t, WriteError> encode_flags(const Header &header)
 {
     if (header.opcode > 0x0fU)
         return write_failure(WriteErrorCode::InvalidOpcode);
@@ -58,7 +58,7 @@ WriteResult write_question_message(const Header &header, std::span<const Questio
 
     auto flags = encode_flags(header);
     if (!flags)
-        return std::unexpected(flags.error());
+        return dns::unexpected(flags.error());
 
     detail::WireWriter writer{maximum_size};
     if (!writer.write_u16(header.id) || !writer.write_u16(*flags) || !writer.write_u16(static_cast<uint16_t>(questions.size())) ||

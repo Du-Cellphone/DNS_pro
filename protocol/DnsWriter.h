@@ -3,7 +3,6 @@
 #include "protocol/DnsMessage.h"
 
 #include <cstddef>
-#include <expected>
 #include <span>
 #include <vector>
 
@@ -28,7 +27,7 @@ struct WriteError
     bool operator==(const WriteError &) const = default;
 };
 
-using WriteResult = std::expected<std::vector<std::byte>, WriteError>;
+using WriteResult = Expected<std::vector<std::byte>, WriteError>;
 
 WriteResult serialize_query(const Header &header, std::span<const Question> questions, size_t maximum_size = 65'535);
 

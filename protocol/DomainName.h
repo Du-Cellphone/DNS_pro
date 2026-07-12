@@ -1,7 +1,8 @@
 #pragma once
 
+#include "common/Expected.h"
+
 #include <cstddef>
-#include <expected>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,8 +36,8 @@ class DomainName
 public:
     DomainName() = default;
 
-    static std::expected<DomainName, DomainNameError> from_text(std::string_view text);
-    static std::expected<DomainName, DomainNameError> from_labels(std::vector<std::string> labels);
+    static Expected<DomainName, DomainNameError> from_text(std::string_view text);
+    static Expected<DomainName, DomainNameError> from_labels(std::vector<std::string> labels);
 
     [[nodiscard]] bool                         is_root() const noexcept { return labels_.empty(); }
     [[nodiscard]] size_t                       wire_size() const noexcept { return wire_size_; }
