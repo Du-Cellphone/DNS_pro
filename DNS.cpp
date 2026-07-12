@@ -1,13 +1,7 @@
 #include "DNS.h"
 
-#include <array>
-#include <cerrno>
 #include <cstring>
 #include <iostream>
-#include <netinet/in.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/socket.h>
 #include <utility>
 
 DNS::~DNS()
@@ -56,26 +50,36 @@ bool DNS::start()
     if (state_ != State::Initialized || !cache_)
         return false;
 
-    std::vector<std::unique_ptr<WorkerContext>> contexts;
-    contexts.reserve(config_.worker_count);
-    for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id)
+    std::vector<std::unique_ptr<dns::server::WorkerLoop>> loops;
+    loops.reserve(config_.worker_count);
+    try
     {
-        auto context = std::make_unique<WorkerContext>();
-        context->worker_id = worker_id;
-        context->cache_shard = &cache_->shard(worker_id);
-        if (!init_network_env(*context, config_.port))
-            return false;
-        contexts.push_back(std::move(context));
+        for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id)
+        {
+            auto loop = dns::server::WorkerLoop::create(worker_id, config_.port, cache_->shard(worker_id));
+            if (!loop)
+            {
+                std::cerr << "failed to initialize worker " << worker_id << " at step " << static_cast<int>(loop.error().step)
+                          << ": " << std::strerror(loop.error().error_number) << '\n';
+                return false;
+            }
+            loops.push_back(std::move(*loop));
+        }
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "failed to allocate worker reactors: " << error.what() << '\n';
+        return false;
     }
 
-    worker_contexts_ = std::move(contexts);
+    worker_loops_ = std::move(loops);
     try
     {
         worker_threads_.reserve(config_.worker_count);
-        for (const auto &context : worker_contexts_)
+        for (const auto &loop : worker_loops_)
         {
-            WorkerContext *worker_context = context.get();
-            worker_threads_.emplace_back([this, worker_context](std::stop_token token) { worker(token, *worker_context); });
+            dns::server::WorkerLoop *worker_loop = loop.get();
+            worker_threads_.emplace_back([worker_loop](std::stop_token token) { worker_loop->run(token); });
         }
 
         manager_threads_.reserve(config_.manager_count);
@@ -87,8 +91,8 @@ bool DNS::start()
         std::cerr << "failed to start DNS threads: " << error.what() << '\n';
         for (auto &thread : worker_threads_)
             thread.request_stop();
-        for (const auto &context : worker_contexts_)
-            context->wake();
+        for (const auto &loop : worker_loops_)
+            loop->request_stop();
         for (auto &thread : manager_threads_)
             thread.request_stop();
         manager_wakeup_.notify_all();
@@ -101,7 +105,7 @@ bool DNS::start()
         failed_workers.clear();
         failed_managers.clear();
         lock.lock();
-        worker_contexts_.clear();
+        worker_loops_.clear();
         return false;
     }
 
@@ -118,8 +122,8 @@ void DNS::request_stop() noexcept
     state_ = State::Stopping;
     for (auto &thread : worker_threads_)
         thread.request_stop();
-    for (const auto &context : worker_contexts_)
-        context->wake();
+    for (const auto &loop : worker_loops_)
+        loop->request_stop();
     for (auto &thread : manager_threads_)
         thread.request_stop();
     manager_wakeup_.notify_all();
@@ -141,7 +145,7 @@ void DNS::join() noexcept
     managers.clear();
 
     std::scoped_lock lock{lifecycle_mutex_};
-    worker_contexts_.clear();
+    worker_loops_.clear();
     if (state_ == State::Stopping || state_ == State::Running)
         state_ = State::Stopped;
 }
@@ -152,119 +156,17 @@ bool DNS::is_running() const noexcept
     return state_ == State::Running;
 }
 
-void DNS::worker(std::stop_token stop_token, WorkerContext &context) noexcept
+std::optional<uint16_t> DNS::bound_port() const noexcept
 {
-    std::array<epoll_event, 64> events{};
-    std::array<uint8_t, 4096>   buffer{};
-
-    while (!stop_token.stop_requested())
-    {
-        const int ready = ::epoll_wait(context.epoll_fd.get(), events.data(), static_cast<int>(events.size()), -1);
-        if (ready < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            std::cerr << "worker " << context.worker_id << " epoll_wait failed: " << std::strerror(errno) << '\n';
-            break;
-        }
-
-        for (int index = 0; index < ready; ++index)
-        {
-            if (events[static_cast<size_t>(index)].data.u64 == kWakeEvent)
-            {
-                context.drain_wakeup();
-                continue;
-            }
-            if (events[static_cast<size_t>(index)].data.u64 != kListenerEvent)
-                continue;
-
-            while (!stop_token.stop_requested())
-            {
-                sockaddr_storage client_address{};
-                socklen_t        client_length = sizeof(client_address);
-                const ssize_t received = ::recvfrom(context.listen_fd.get(), buffer.data(), buffer.size(), 0,
-                                                    reinterpret_cast<sockaddr *>(&client_address), &client_length);
-                if (received >= 0)
-                    continue;
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break;
-                std::cerr << "worker " << context.worker_id << " recvfrom failed: " << std::strerror(errno) << '\n';
-                break;
-            }
-        }
-    }
+    std::scoped_lock lock{lifecycle_mutex_};
+    if (worker_loops_.empty())
+        return std::nullopt;
+    return worker_loops_.front()->bound_port();
 }
 
 void DNS::manager(std::stop_token stop_token) noexcept
 {
-    std::mutex              wait_mutex;
-    std::unique_lock        lock{wait_mutex};
+    std::mutex       wait_mutex;
+    std::unique_lock lock{wait_mutex};
     manager_wakeup_.wait(lock, stop_token, [] { return false; });
-}
-
-bool DNS::init_network_env(WorkerContext &context, uint16_t port)
-{
-    dns::runtime::UniqueFd listener{::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
-    if (!listener)
-    {
-        std::cerr << "failed to create UDP socket: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    int enabled = 1;
-    if (::setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0 ||
-        ::setsockopt(listener.get(), SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) < 0)
-    {
-        std::cerr << "failed to configure UDP socket: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(port);
-    if (::bind(listener.get(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0)
-    {
-        std::cerr << "failed to bind UDP socket: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    dns::runtime::UniqueFd epoll{::epoll_create1(EPOLL_CLOEXEC)};
-    if (!epoll)
-    {
-        std::cerr << "failed to create epoll: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    dns::runtime::UniqueFd wake{::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)};
-    if (!wake)
-    {
-        std::cerr << "failed to create worker eventfd: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    epoll_event listener_event{};
-    listener_event.events = EPOLLIN | EPOLLET;
-    listener_event.data.u64 = kListenerEvent;
-    if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, listener.get(), &listener_event) < 0)
-    {
-        std::cerr << "failed to register UDP socket with epoll: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    epoll_event wake_event{};
-    wake_event.events = EPOLLIN;
-    wake_event.data.u64 = kWakeEvent;
-    if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, wake.get(), &wake_event) < 0)
-    {
-        std::cerr << "failed to register eventfd with epoll: " << std::strerror(errno) << '\n';
-        return false;
-    }
-
-    context.listen_fd = std::move(listener);
-    context.epoll_fd = std::move(epoll);
-    context.wake_fd = std::move(wake);
-    return true;
 }

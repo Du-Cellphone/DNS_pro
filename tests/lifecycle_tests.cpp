@@ -1,5 +1,4 @@
 #include "DNS.h"
-#include "WorkerContext.h"
 #include "runtime/UniqueFd.h"
 
 #include <cerrno>
@@ -7,7 +6,6 @@
 #include <fcntl.h>
 #include <iostream>
 #include <string_view>
-#include <sys/eventfd.h>
 #include <unistd.h>
 #include <utility>
 
@@ -52,21 +50,6 @@ void test_unique_fd_ownership()
     ::close(pipe_fds[1]);
 }
 
-void test_worker_wakeup_event()
-{
-    WorkerContext context;
-    context.wake_fd.reset(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
-    require(static_cast<bool>(context.wake_fd), "eventfd fixture must be created");
-
-    context.wake();
-    context.drain_wakeup();
-
-    uint64_t value{0};
-    errno = 0;
-    require(::read(context.wake_fd.get(), &value, sizeof(value)) == -1 && errno == EAGAIN,
-            "drain_wakeup must consume the stop notification without blocking");
-}
-
 void test_service_configuration_and_stop()
 {
     DNS service;
@@ -109,7 +92,6 @@ void test_service_configuration_and_stop()
 int main()
 {
     test_unique_fd_ownership();
-    test_worker_wakeup_event();
     test_service_configuration_and_stop();
     std::cout << "all lifecycle tests passed\n";
     return EXIT_SUCCESS;

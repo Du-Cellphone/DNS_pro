@@ -43,6 +43,7 @@ add_library(dns_core STATIC
     protocol/DnsWriter.cpp
     protocol/DomainName.cpp
     RadixTree.cpp
+    WorkerLoop.cpp
 )
 
 target_include_directories(dns_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -98,4 +99,11 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_lifecycle_tests)
     add_test(NAME dns_lifecycle_tests COMMAND dns_lifecycle_tests)
     set_tests_properties(dns_lifecycle_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_reactor_tests tests/reactor_tests.cpp)
+    target_link_libraries(dns_reactor_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_reactor_tests)
+    dns_pro_enable_sanitizers(dns_reactor_tests)
+    add_test(NAME dns_reactor_tests COMMAND dns_reactor_tests)
+    set_tests_properties(dns_reactor_tests PROPERTIES TIMEOUT 10)
 endif()

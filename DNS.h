@@ -2,7 +2,7 @@
 
 #include "DNS_Cache.h"
 #include "DomainBlocklist.h"
-#include "WorkerContext.h"
+#include "WorkerLoop.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -43,6 +44,7 @@ public:
     void join() noexcept;
 
     [[nodiscard]] bool is_running() const noexcept;
+    [[nodiscard]] std::optional<uint16_t> bound_port() const noexcept;
 
 private:
     enum class State
@@ -54,11 +56,6 @@ private:
         Stopped,
     };
 
-    static constexpr uint64_t kListenerEvent = 1;
-    static constexpr uint64_t kWakeEvent     = 2;
-
-    bool init_network_env(WorkerContext &context, uint16_t port);
-    void worker(std::stop_token stop_token, WorkerContext &context) noexcept;
     void manager(std::stop_token stop_token) noexcept;
 
     mutable std::mutex lifecycle_mutex_;
@@ -68,7 +65,7 @@ private:
 
     std::atomic<std::shared_ptr<const FilterContext>> active_context_{nullptr};
     std::unique_ptr<Cache::DNS_Cache> cache_;
-    std::vector<std::unique_ptr<WorkerContext>> worker_contexts_;
+    std::vector<std::unique_ptr<dns::server::WorkerLoop>> worker_loops_;
     std::vector<std::jthread> worker_threads_;
     std::vector<std::jthread> manager_threads_;
 };
