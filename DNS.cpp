@@ -19,8 +19,8 @@ bool DNS::init(size_t worker_thread_cnt, size_t manager_thread_cnt)
     if (worker_thread_cnt + manager_thread_cnt <= 1)
         return false;
 
-    cache = std::make_unique<Cache::DNS_Cache>(worker_thread_cnt);
-    active_context.store(std::make_shared<FilterContext>());
+    cache = std::make_unique<Cache::DNS_Cache>(Cache::DEFAULT_TOTAL_CAPACITY, worker_thread_cnt);
+    active_context.store(std::make_shared<const FilterContext>());
 
     worker_count  = worker_thread_cnt;
     manager_count = manager_thread_cnt;

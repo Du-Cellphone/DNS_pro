@@ -1,64 +1,58 @@
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
 #include "RadixTree.h"
 
-std::vector<std::string_view> split_and_reverse(std::string_view domain)
+#include <utility>
+
+RadixTree::RadixTree()
+    : root_(std::make_unique<TrieNode>())
 {
-    std::vector<std::string_view> labels;
-    labels.reserve(8);
-
-    size_t end = domain.length();
-    while (end > 0)
-    {
-        size_t start = domain.find_last_of('.', end - 1);
-        if (start == std::string_view::npos)
-        {
-            labels.emplace_back(domain.substr(0, end));
-            break;
-        }
-
-        labels.emplace_back(domain.substr(start + 1, end - (start + 1)));
-        end = start;
-    }
-    return labels;
 }
 
-void RadixTree::insert(const std::string &domain)
+bool RadixTree::insert(const dns::protocol::DomainName &domain)
 {
-    string_storage.push_back(domain);
-    // TODO 能不能预先分配好labels的空间？避免热路径上每次都需要创建动态对象
-    std::vector<std::string_view> labels  = split_and_reverse(string_storage.back());
-    TrieNode                     *current = root.get();
+    TrieNode *current = root_.get();
+    const auto labels = domain.labels();
 
-    // TODO 通配符*和?的处理，目前是直接当成普通字符插入树中
-    // TODO 目前是完全匹配，后续可以考虑支持通配符和正则表达式等更复杂的匹配规则
-    // TODO 连续的通配符，例如 **.example.com 这种情况如何处理？目前是两个*当作一个标签插入树中
-    // TODO 连续的相同单字符标签，例如 a.a.a.a.com，可能会退化为字典树
-    // TODO 如果某个标签已经是is_end_of_domain了，那么需不需要剪枝？
-    for (std::string_view label : labels)
+    for (size_t reverse_index = labels.size(); reverse_index > 0; --reverse_index)
     {
-        if (current->children.find(label) == current->children.end())
-            current->children[label] = std::make_unique<TrieNode>();
-        current = current->children[label].get();
+        const std::string_view canonical_label = domain.canonical_label(reverse_index - 1);
+        auto [child, inserted] = current->children.try_emplace(std::string{canonical_label});
+        if (inserted)
+            child->second = std::make_unique<TrieNode>();
+        current = child->second.get();
     }
+
+    const bool newly_inserted = !current->is_end_of_domain;
     current->is_end_of_domain = true;
+    return newly_inserted;
 }
 
-bool RadixTree::search(const std::string &domain) const
+bool RadixTree::insert(std::string_view domain)
 {
-    std::vector<std::string_view> labels = split_and_reverse(domain);
+    auto normalized = dns::protocol::DomainName::from_text(domain);
+    return normalized && insert(*normalized);
+}
 
-    TrieNode *current = root.get();
-    for (std::string_view label : labels)
+bool RadixTree::search(const dns::protocol::DomainName &domain) const noexcept
+{
+    const TrieNode *current = root_.get();
+    const auto      labels  = domain.labels();
+
+    for (size_t reverse_index = labels.size(); reverse_index > 0; --reverse_index)
     {
-        if (current->children.find(label) == current->children.end())
+        const std::string_view canonical_label = domain.canonical_label(reverse_index - 1);
+        const auto child = current->children.find(canonical_label);
+        if (child == current->children.end())
             return false;
-        current = current->children[label].get();
-
+        current = child->second.get();
         if (current->is_end_of_domain)
-            return true; // 适配通配符和子域名，例如 *.example.com 和 example.com 都能匹配到 example.com 和 www.example.com
+            return true;
     }
+
     return current->is_end_of_domain;
+}
+
+bool RadixTree::search(std::string_view domain) const
+{
+    auto normalized = dns::protocol::DomainName::from_text(domain);
+    return normalized && search(*normalized);
 }

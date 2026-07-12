@@ -170,6 +170,28 @@ std::string DomainName::to_string() const
     return result;
 }
 
+std::string_view DomainName::canonical_suffix_key(size_t first_label) const noexcept
+{
+    if (first_label >= labels_.size())
+        return {};
+
+    size_t offset = 0;
+    for (size_t index = 0; index < first_label; ++index)
+        offset += labels_[index].size() + 1;
+    return std::string_view{canonical_key_}.substr(offset);
+}
+
+std::string_view DomainName::canonical_label(size_t index) const noexcept
+{
+    if (index >= labels_.size())
+        return {};
+
+    size_t offset = 0;
+    for (size_t current = 0; current < index; ++current)
+        offset += labels_[current].size() + 1;
+    return std::string_view{canonical_key_}.substr(offset + 1, labels_[index].size());
+}
+
 std::string DomainName::to_canonical_string() const
 {
     if (is_root())

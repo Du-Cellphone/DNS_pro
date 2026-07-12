@@ -184,7 +184,8 @@ FilterBuildStats build_filter(const std::vector<std::string> &domains)
         stats.filter = std::make_unique<Filter::CuckooFilter>(estimate_filter_bucket_count(domains.size()));
         for (const std::string &domain : domains)
         {
-            if (!stats.filter->insert(domain))
+            auto normalized = dns::protocol::DomainName::from_text(domain);
+            if (!normalized || !stats.filter->insert(normalized->canonical_key()))
                 throw std::runtime_error("failed to insert domain into CuckooFilter");
         }
     });
@@ -211,7 +212,8 @@ FilterLookupStats run_filter_lookup(const Filter::CuckooFilter &filter, const st
     stats.ms = measure_ms([&]() {
         for (const std::string &query : queries)
         {
-            const bool positive = filter.contains(query);
+            auto normalized = dns::protocol::DomainName::from_text(query);
+            const bool positive = normalized && filter.contains(normalized->canonical_key());
             stats.positives += positive ? 1ULL : 0ULL;
             benchmark_sink += positive ? 1ULL : 0ULL;
         }
@@ -225,11 +227,24 @@ PipelineLookupStats run_pipeline_lookup(const Filter::CuckooFilter &filter, cons
     stats.ms = measure_ms([&]() {
         for (const std::string &query : queries)
         {
-            if (!filter.contains(query))
+            auto normalized = dns::protocol::DomainName::from_text(query);
+            if (!normalized)
+                continue;
+
+            bool possibly_matches = false;
+            for (size_t first_label = 0; first_label < normalized->label_count(); ++first_label)
+            {
+                if (filter.contains(normalized->canonical_suffix_key(first_label)))
+                {
+                    possibly_matches = true;
+                    break;
+                }
+            }
+            if (!possibly_matches)
                 continue;
 
             ++stats.tree_checks;
-            const bool found = tree.search(query);
+            const bool found = tree.search(*normalized);
             stats.hits += found ? 1ULL : 0ULL;
             benchmark_sink += found ? 1ULL : 0ULL;
         }

@@ -1,182 +1,166 @@
 #include "CuckooFilter.h"
-#include <cassert>
-#include <bit>
-#include <cstddef>
-#include <cstdint>
-#include <cstdlib>
-#include <functional>
-#include <optional>
-#include <stdexcept>
-#include <string_view>
+
 #include "HashUtils.hpp"
 
+#include <algorithm>
+#include <bit>
+#include <limits>
+#include <stdexcept>
 
 namespace Filter
 {
-CuckooFilter::CuckooFilter(size_t cap)
-    : capacity(std::bit_ceil(cap < 4 ? 4 : cap)) // 确保容量是2的幂次方
+namespace
 {
-    assert(capacity >= 4);
-    assert((capacity & (capacity - 1)) == 0); // 确保capacity是2的幂次方
-    table.assign(capacity, Bucket{});
 
-    rng_state = splitmix64(static_cast<uint64_t>(capacity) ^ 0xD1B54A32D192ED03ULL); // 初始化随机数生成器状态
+size_t normalize_bucket_count(size_t requested)
+{
+    requested = std::max<size_t>(requested, 4);
+    constexpr size_t maximum_power_of_two = size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+    if (requested > maximum_power_of_two)
+        throw std::length_error("CuckooFilter bucket count is too large");
+    return std::bit_ceil(requested);
+}
 
-    while (!build_table())
+size_t load_limit(size_t total_slots) noexcept
+{
+    return (total_slots / 100) * 95 + ((total_slots % 100) * 95) / 100;
+}
+
+} // namespace
+
+CuckooFilter::CuckooFilter(size_t requested_bucket_count, size_t maximum_kicks)
+    : maximum_kicks_(maximum_kicks)
+{
+    const size_t bucket_count = normalize_bucket_count(requested_bucket_count);
+    if (bucket_count > buckets_.max_size() || bucket_count > std::numeric_limits<size_t>::max() / FPS_PER_BUCKET)
+        throw std::length_error("CuckooFilter capacity overflows size_t");
+    buckets_.resize(bucket_count);
+    rng_state_ = splitmix64(static_cast<uint64_t>(buckets_.size()) ^ 0xD1B54A32D192ED03ULL);
+}
+
+bool CuckooFilter::insert(std::string_view item)
+{
+    last_failure_ = InsertFailureReason::None;
+    const uint64_t    hash = xxH3_64bits(item);
+    const Fingerprint fingerprint = calc_fp(hash);
+    const size_t      index1 = static_cast<size_t>(hash) & (buckets_.size() - 1);
+
+    if (find_fp(index1, fingerprint))
+        return true;
+
+    const size_t total_slots = buckets_.size() * FPS_PER_BUCKET;
+    if (size_ >= load_limit(total_slots))
     {
-        if (capacity == SIZE_MAX)
-            throw std::runtime_error("CuckooFilter: Reached maximum capacity, cannot build filter");
-
-        capacity = capacity * 2 > SIZE_MAX ? SIZE_MAX : capacity * 2;
-        table.assign(capacity, Bucket{});
-        size      = 0;
-        rng_state = splitmix64(rng_state ^ static_cast<uint64_t>(capacity));
-    }
-}
-
-bool CuckooFilter::build_table(/*could be databse or file input*/)
-{
-    // 实际构建逻辑后续接数据库或文件加载。
-    // 当前保持空表初始化，调用方在基准或业务代码中通过循环 insert() 构建过滤器。
-    return true;
-}
-
-bool CuckooFilter::insert(const std::string_view &item)
-{
-    uint64_t    hash = xxH3_64bits(item);
-    Fingerprint fp{calc_fp(hash)};
-
-    size_t index1 = static_cast<size_t>(hash) & (capacity - 1);
-    if (find_fp(index1, fp))
-        return true; // 已存在，无需插入
-
-    // 插入前检查负载，如果过高则拒绝插入以避免性能急剧下降
-    const uint64_t limit = (static_cast<uint64_t>(capacity) * static_cast<uint64_t>(FPS_PER_BUCKET) * 95ULL) / 100ULL; // 95%负载上限
-    if (static_cast<uint64_t>(size) + 1ULL > limit)
+        last_failure_ = InsertFailureReason::LoadLimit;
         return false;
+    }
 
     if (auto empty_slot = find_empty_slot(index1))
     {
-        empty_slot->get() = fp;
-        size++;
+        buckets_[index1].fingerprints[*empty_slot] = fingerprint;
+        ++size_;
         return true;
     }
-    size_t index2 = alter_index(index1, fp);
+
+    const size_t index2 = alternate_index(index1, fingerprint);
     if (auto empty_slot = find_empty_slot(index2))
     {
-        empty_slot->get() = fp;
-        size++;
+        buckets_[index2].fingerprints[*empty_slot] = fingerprint;
+        ++size_;
         return true;
     }
 
-    // 随机一个桶
-    size_t victim_idx = ((next_rand_u64() & 1ULL) == 0ULL) ? index1 : index2;
+    const uint64_t rng_before = rng_state_;
+    const size_t victim_index = (next_rand_u64() & 1ULL) == 0 ? index1 : index2;
+    if (kick_out(victim_index, fingerprint))
+        return true;
 
-    return kick_out(victim_idx, fp); // 可能会失败，返回false表示插入失败
-}
-
-bool CuckooFilter::contains(const std::string_view &item) const
-{
-    uint64_t hash = xxH3_64bits(item);
-    // 使用高16位作为指纹，且确保指纹不为0，因为0表示空槽
-    Fingerprint fp{calc_fp(hash)};
-
-    size_t index1 = static_cast<size_t>(hash) & (capacity - 1); // 计算第一个桶的索引，使用位运算代替取模，前提是capacity必须是2的幂次方
-
-    return find_fp(index1, fp);
-}
-
-// 只读查找
-bool CuckooFilter::find_fp(const size_t index1, const Fingerprint &fp) const
-{
-    const Bucket &b1 = table[index1];
-    for (const Fingerprint &f : b1.fingerprints)
-    {
-        if (f == fp)
-            return true;
-    }
-
-    // 第一个桶没找到，则在第二个桶接着找
-    // size_t index2 = index1 ^ G(fp) G为整数混淆函数
-    size_t index2 = alter_index(index1, fp);
-
-    const Bucket &b2 = table[index2];
-    for (const Fingerprint &f : b2.fingerprints)
-    {
-        if (f == fp)
-            return true;
-    }
+    rng_state_ = rng_before;
+    last_failure_ = InsertFailureReason::KickLimit;
     return false;
 }
 
-
-std::optional<std::reference_wrapper<Fingerprint>> CuckooFilter::find_empty_slot(const size_t index)
+bool CuckooFilter::contains(std::string_view item) const noexcept
 {
-    Bucket &b1 = table[index];
-    for (Fingerprint &f : b1.fingerprints)
-    {
-        if (f.none())
-            return std::ref(f);
-    }
+    const uint64_t    hash = xxH3_64bits(item);
+    const Fingerprint fingerprint = calc_fp(hash);
+    const size_t      index = static_cast<size_t>(hash) & (buckets_.size() - 1);
+    return find_fp(index, fingerprint);
+}
 
+bool CuckooFilter::find_fp(size_t index, const Fingerprint &fingerprint) const noexcept
+{
+    const auto contains_in_bucket = [&](size_t bucket_index) {
+        const auto &slots = buckets_[bucket_index].fingerprints;
+        return std::find(slots.begin(), slots.end(), fingerprint) != slots.end();
+    };
+    return contains_in_bucket(index) || contains_in_bucket(alternate_index(index, fingerprint));
+}
+
+std::optional<size_t> CuckooFilter::find_empty_slot(size_t index) const noexcept
+{
+    const auto &slots = buckets_[index].fingerprints;
+    for (size_t slot = 0; slot < slots.size(); ++slot)
+    {
+        if (slots[slot].none())
+            return slot;
+    }
     return std::nullopt;
 }
 
-bool CuckooFilter::kick_out(size_t victim_idx, Fingerprint &fp)
+bool CuckooFilter::kick_out(size_t victim_index, Fingerprint fingerprint)
 {
-    size_t cnt{0};
-    do
+    std::vector<KickRecord> history;
+    history.reserve(maximum_kicks_);
+
+    for (size_t kick = 0; kick < maximum_kicks_; ++kick)
     {
-        const size_t victim_fp_idx = static_cast<size_t>(next_rand_u64() % FPS_PER_BUCKET); // 随机选择一个受害者指纹槽index
+        const size_t slot = static_cast<size_t>(next_rand_u64() % FPS_PER_BUCKET);
+        Fingerprint &victim = buckets_[victim_index].fingerprints[slot];
+        history.push_back(KickRecord{victim_index, slot, victim});
+        std::swap(victim, fingerprint);
 
-        Fingerprint victim_fp                         = table[victim_idx].fingerprints[victim_fp_idx]; // 暂存
-        table[victim_idx].fingerprints[victim_fp_idx] = fp;                                            // 覆盖
-
-        const size_t victim_next_idx = alter_index(victim_idx, victim_fp);
-        if (auto empty_slot = find_empty_slot(victim_next_idx))
+        victim_index = alternate_index(victim_index, fingerprint);
+        if (auto empty_slot = find_empty_slot(victim_index))
         {
-            empty_slot->get() = victim_fp;
-            size++;
+            buckets_[victim_index].fingerprints[*empty_slot] = fingerprint;
+            ++size_;
             return true;
         }
-        // 继续踢出下一个，fp永远代表当前要插入的指纹
-        fp         = victim_fp;
-        victim_idx = victim_next_idx; // 下一个受害者为当前受害者的备用位置
-    } while (++cnt < MAX_KICKS);
+    }
 
+    for (auto record = history.rbegin(); record != history.rend(); ++record)
+        buckets_[record->bucket_index].fingerprints[record->slot_index] = record->previous;
     return false;
 }
 
-
-Fingerprint CuckooFilter::calc_fp(const uint64_t hash) const
+Fingerprint CuckooFilter::calc_fp(uint64_t hash) const noexcept
 {
-    const uint16_t high16bits = static_cast<uint16_t>((hash >> (64 - FINGERPRINT_LEN)));
-    return Fingerprint{high16bits % MAX_FINGERPRINT_VALUE + 1}; // 确保指纹不为0，因为0表示空槽
+    const uint16_t high16bits = static_cast<uint16_t>(hash >> (64 - FINGERPRINT_LEN));
+    return Fingerprint{high16bits % MAX_FINGERPRINT_VALUE + 1};
 }
 
-inline uint64_t CuckooFilter::splitmix64(uint64_t x) const
+uint64_t CuckooFilter::splitmix64(uint64_t value) const noexcept
 {
-    // 固定的“魔法”常数，都是精心挑选的
-    x += 0x9e3779b97f4a7c15;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111eb;
-    x = x ^ (x >> 31);
-    return x;
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
 }
 
-size_t CuckooFilter::alter_index(size_t index, const Fingerprint &fp) const
+size_t CuckooFilter::alternate_index(size_t index, const Fingerprint &fingerprint) const noexcept
 {
-    const size_t mask  = capacity - 1;
-    size_t       delta = static_cast<size_t>(splitmix64(fp.to_ullong())) & mask;
+    const size_t mask = buckets_.size() - 1;
+    size_t delta = static_cast<size_t>(splitmix64(fingerprint.to_ullong())) & mask;
     if (delta == 0)
-        delta = 1; // 确保delta不为0，否则indxe2与index1冲突
+        delta = 1;
     return index ^ delta;
 }
 
-uint64_t CuckooFilter::next_rand_u64()
+uint64_t CuckooFilter::next_rand_u64() noexcept
 {
-    rng_state += 0x9e3779b97f4a7c15ULL;
-    return splitmix64(rng_state);
+    rng_state_ += 0x9e3779b97f4a7c15ULL;
+    return splitmix64(rng_state_);
 }
 
 } // namespace Filter

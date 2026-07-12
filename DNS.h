@@ -1,7 +1,6 @@
 #pragma once
 
-#include "CuckooFilter.h"
-#include "RadixTree.h"
+#include "DomainBlocklist.h"
 #include "DNS_Cache.h"
 #include "WorkerContext.h"
 #include <atomic>
@@ -12,14 +11,7 @@
 
 struct FilterContext
 {
-    std::unique_ptr<Filter::CuckooFilter> cuckoo;
-    std::unique_ptr<RadixTree>            trie;
-
-    FilterContext()
-        : cuckoo(std::make_unique<Filter::CuckooFilter>())
-        , trie(std::make_unique<RadixTree>())
-    {
-    }
+    Filter::DomainBlocklist blocklist;
 };
 
 class DNS
@@ -34,9 +26,8 @@ private:
     void manager();
 
 private:
-    std::atomic<std::shared_ptr<FilterContext>> active_context{nullptr};
-    std::atomic<std::shared_ptr<FilterContext>> update_context{nullptr};
-    std::unique_ptr<Cache::DNS_Cache>           cache{nullptr};
+    std::atomic<std::shared_ptr<const FilterContext>> active_context{nullptr};
+    std::unique_ptr<Cache::DNS_Cache>                 cache{nullptr};
     std::vector<std::jthread>                   worker_threads;
     std::vector<std::jthread>                   manager_threads;
     size_t                                      worker_count{0};

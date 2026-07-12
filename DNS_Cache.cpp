@@ -1,108 +1,150 @@
 #include "DNS_Cache.h"
-#include <cstddef>
-#include <memory>
-#include <optional>
-#include <vector>
+
+#include "HashUtils.hpp"
+
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace Cache
 {
 
-
-thread_local int my_shard_id = -1;
-
-DNS_Cache::DNS_Cache(size_t shard_cnt)
+IPAddress IPAddress::v4(std::array<uint8_t, 4> value) noexcept
 {
-    shard_count = shard_cnt;
-    for (size_t i = 0; i < shard_count; ++i)
-    {
-        cache_shards.emplace_back(new CacheShard);
-    }
+    IPAddress result;
+    std::copy(value.begin(), value.end(), result.bytes.begin());
+    result.family = AF_INET;
+    return result;
 }
 
-
-void DNS_Cache::initialize_thread_shard(int id)
+IPAddress IPAddress::v6(std::array<uint8_t, 16> value) noexcept
 {
-    my_shard_id = id % shard_count;
+    IPAddress result;
+    result.bytes = value;
+    result.family = AF_INET6;
+    return result;
 }
 
-
-std::optional<IPAddress> DNS_Cache::get(const std::string &domain, const TimePoint &now)
+size_t CacheKeyHash::operator()(const CacheKey &key) const noexcept
 {
-    return cache_shards[my_shard_id]->get(domain, now);
+    uint64_t hash = xxH3_64bits(key.qname);
+    hash ^= static_cast<uint64_t>(key.qtype) << 32U;
+    hash ^= static_cast<uint64_t>(key.qclass) << 48U;
+    hash ^= hash >> 30U;
+    hash *= 0xbf58476d1ce4e5b9ULL;
+    hash ^= hash >> 27U;
+    return static_cast<size_t>(hash);
 }
 
-
-void DNS_Cache::put(const std::string &domain, const IPAddress &ip, const TimePoint &now)
+CacheShard::CacheShard(size_t capacity)
+    : capacity_(capacity)
 {
-    cache_shards[my_shard_id]->put(domain, ip, now);
+    entries_.reserve(capacity_);
+    index_.max_load_factor(0.75F);
+    index_.reserve(capacity_);
 }
 
-
-std::optional<IPAddress> DNS_Cache::CacheShard::get(const std::string &domain, const TimePoint &now)
+std::optional<CacheHit> CacheShard::get(const CacheKey &key, TimePoint now)
 {
-
-    Hash_Table::iterator it = hash_table.find(domain);
-    if (it == hash_table.end() || now > entries[it->second].expiry) // TODO 如果请求TYPE_A但缓存里是TYPE_AAAA，这样的情况目前是无法命中的
+    const auto found = index_.find(key);
+    if (found == index_.end())
         return std::nullopt;
 
-    CacheEntry &entry = entries[it->second];
-    entry.chance      = true;
-    return entry.ip;
+    std::optional<CacheEntry> &slot = entries_[found->second];
+    if (!slot || now >= slot->expiry)
+    {
+        index_.erase(found);
+        slot.reset();
+        return std::nullopt;
+    }
+
+    slot->chance = true;
+    const auto remaining = std::chrono::ceil<std::chrono::seconds>(slot->expiry - now).count();
+    const auto bounded_remaining = std::clamp<int64_t>(remaining, 1, std::numeric_limits<uint32_t>::max());
+    return CacheHit{slot->address, static_cast<uint32_t>(bounded_remaining)};
 }
 
-
-void DNS_Cache::CacheShard::put(const std::string &domain, const IPAddress &ip, const TimePoint &now)
+void CacheShard::put(CacheKey key, IPAddress address, uint32_t ttl_seconds, TimePoint now)
 {
-    Hash_Table::iterator it = hash_table.find(domain);
-    if (it != hash_table.end()) // 已在缓存中，则更新一下
+    const auto existing = index_.find(key);
+    if (ttl_seconds == 0)
     {
-        CacheEntry &entry = entries[it->second];
-        entry.ip          = ip;
-        entry.expiry      = now + DEFAULT_TTL;
-        entry.chance      = true;
+        if (existing != index_.end())
+        {
+            entries_[existing->second].reset();
+            index_.erase(existing);
+        }
         return;
     }
 
-    if (entries.size() < entries.capacity()) // entries未满
+    const TimePoint expiry = now + std::chrono::seconds{ttl_seconds};
+    if (existing != index_.end())
     {
-        hash_table[domain] = entries.size();
-        entries.emplace_back(domain, ip, now + DEFAULT_TTL);
+        CacheEntry &entry = *entries_[existing->second];
+        entry.address = address;
+        entry.expiry = expiry;
+        entry.chance = true;
+        return;
+    }
+
+    if (capacity_ == 0)
+        return;
+
+    if (entries_.size() < capacity_)
+    {
+        const size_t slot_index = entries_.size();
+        entries_.emplace_back(CacheEntry{std::move(key), address, expiry, true});
+        index_.emplace(entries_.back()->key, slot_index);
         return;
     }
 
     while (true)
     {
-        CacheEntry &current    = entries[hand];
-        bool        has_chance = current.chance;
-        bool        is_expired = now > current.expiry;
-
-        if (!has_chance || is_expired)
+        std::optional<CacheEntry> &slot = entries_[hand_];
+        if (!slot || now >= slot->expiry || !slot->chance)
         {
-            hash_table.erase(current.domain);
-            hash_table[domain] = hand;
-
-            current.domain = domain;
-            current.ip     = ip;
-            current.expiry = now + DEFAULT_TTL;
-            current.chance = true;
-
-            hand = (hand + 1) % entries.size();
+            replace_slot(hand_, std::move(key), address, expiry);
+            hand_ = (hand_ + 1) % capacity_;
             return;
         }
-        else
-        {
-            current.chance = false;
-            hand           = (hand + 1) % entries.size();
-        }
+
+        slot->chance = false;
+        hand_ = (hand_ + 1) % capacity_;
     }
 }
 
-
-DNS_Cache::CacheShard::CacheShard()
+void CacheShard::replace_slot(size_t slot_index, CacheKey key, IPAddress address, TimePoint expiry)
 {
-    hash_table.reserve(TABLE_SIZE / 0.75); // 负载因子0.75
-    entries.reserve(TABLE_SIZE);
+    std::optional<CacheEntry> &slot = entries_[slot_index];
+    if (slot)
+        index_.erase(slot->key);
+
+    slot.emplace(CacheEntry{std::move(key), address, expiry, true});
+    index_.emplace(slot->key, slot_index);
 }
 
+DNS_Cache::DNS_Cache(size_t total_capacity, size_t shard_count)
+    : total_capacity_(total_capacity)
+{
+    if (shard_count == 0)
+        throw std::invalid_argument("DNS_Cache requires at least one shard");
+
+    shards_.reserve(shard_count);
+    const size_t base_capacity = total_capacity / shard_count;
+    const size_t remainder = total_capacity % shard_count;
+    for (size_t index = 0; index < shard_count; ++index)
+        shards_.emplace_back(base_capacity + (index < remainder ? 1 : 0));
+}
+
+CacheShard &DNS_Cache::shard(size_t worker_id)
+{
+    return shards_.at(worker_id);
+}
+
+const CacheShard &DNS_Cache::shard(size_t worker_id) const
+{
+    return shards_.at(worker_id);
+}
 
 } // namespace Cache

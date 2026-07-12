@@ -87,6 +87,8 @@ struct DomainHash
 
 struct SvCRC32
 {
+    using is_transparent = void;
+
     size_t operator()(std::string_view value) const noexcept { return HashDetail::crc32_or_fallback(value); }
 };
 

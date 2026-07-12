@@ -36,6 +36,7 @@ add_library(dns_core STATIC
     DNS.cpp
     DNS_Cache.cpp
     CuckooFilter.cpp
+    DomainBlocklist.cpp
     protocol/DnsParser.cpp
     protocol/DnsQuery.cpp
     protocol/DnsWriter.cpp
@@ -75,4 +76,18 @@ if(BUILD_TESTING)
 
     add_test(NAME dns_protocol_tests COMMAND dns_protocol_tests)
     set_tests_properties(dns_protocol_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_filter_tests tests/filter_tests.cpp)
+    target_link_libraries(dns_filter_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_filter_tests)
+    dns_pro_enable_sanitizers(dns_filter_tests)
+    add_test(NAME dns_filter_tests COMMAND dns_filter_tests)
+    set_tests_properties(dns_filter_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_cache_tests tests/cache_tests.cpp)
+    target_link_libraries(dns_cache_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_cache_tests)
+    dns_pro_enable_sanitizers(dns_cache_tests)
+    add_test(NAME dns_cache_tests COMMAND dns_cache_tests)
+    set_tests_properties(dns_cache_tests PROPERTIES TIMEOUT 10)
 endif()

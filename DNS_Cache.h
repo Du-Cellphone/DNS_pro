@@ -1,114 +1,116 @@
 #pragma once
+
+#include "protocol/DomainName.h"
+
 #include <array>
 #include <chrono>
-#include <cstring>
-#include <memory>
-#include <optional>
 #include <cstddef>
 #include <cstdint>
-#include <ctime>
+#include <optional>
+#include <string>
 #include <sys/socket.h>
 #include <unordered_map>
 #include <vector>
-#include "HashUtils.hpp"
 
 namespace Cache
 {
 
-inline constexpr size_t TABLE_SIZE     = 1'000'000;
-inline constexpr size_t MAX_DOMAIN_LEN = 256;
-// inline const size_t                   SHARD_CNT      = std::thread::hardware_concurrency();
-// inline constexpr size_t               CACHE_LINE     = std::hardware_destructive_interference_size;
-inline constexpr std::chrono::seconds DEFAULT_TTL{300};
+inline constexpr size_t DEFAULT_TOTAL_CAPACITY = 1'000'000;
 
-
-
-using Hash_Table = std::unordered_map<std::string, uint32_t, XXH3_64>;
-using TimePoint  = std::chrono::high_resolution_clock::time_point;
+using Clock     = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
 
 struct IPAddress
 {
     std::array<uint8_t, 16> bytes{};
-    sa_family_t             family = AF_UNSPEC;
+    sa_family_t             family{AF_UNSPEC};
+
+    IPAddress() = default;
+
+    static IPAddress v4(std::array<uint8_t, 4> value) noexcept;
+    static IPAddress v6(std::array<uint8_t, 16> value) noexcept;
 
     [[nodiscard]] bool is_v4() const noexcept { return family == AF_INET; }
     [[nodiscard]] bool is_v6() const noexcept { return family == AF_INET6; }
 
-    IPAddress(const IPAddress &)            = default;
-    IPAddress(IPAddress &&)                 = default;
-    IPAddress &operator=(const IPAddress &) = default;
-    IPAddress &operator=(IPAddress &&)      = default;
-    bool       operator==(const IPAddress &other) const noexcept { return family == other.family && bytes == other.bytes; }
+    bool operator==(const IPAddress &) const = default;
 };
 
-struct CacheEntry
+struct CacheKey
 {
-    std::string domain;
-    IPAddress   ip;
-    TimePoint   expiry;
-    bool        chance{true};
+    std::string qname;
+    uint16_t    qtype{0};
+    uint16_t    qclass{0};
 
-
-    CacheEntry(std::string d, IPAddress i, TimePoint e)
-        : domain(d)
-        , ip(i)
-        , expiry(e)
-        , chance(true)
+    CacheKey() = default;
+    CacheKey(const dns::protocol::DomainName &name, uint16_t type, uint16_t record_class)
+        : qname(name.canonical_key())
+        , qtype(type)
+        , qclass(record_class)
     {
     }
 
-    CacheEntry(const CacheEntry &other)
-        : domain(other.domain)
-        , ip(other.ip)
-        , expiry(other.expiry)
-        , chance(other.chance)
-    {
-    }
+    bool operator==(const CacheKey &) const = default;
+};
 
-    CacheEntry(CacheEntry &&other) noexcept
-        : domain(std::move(other.domain))
-        , ip(std::move(other.ip))
-        , expiry(other.expiry)
-        , chance(other.chance)
-    {
-    }
+struct CacheKeyHash
+{
+    size_t operator()(const CacheKey &key) const noexcept;
+};
 
-    CacheEntry &operator=(CacheEntry &&other) noexcept
+struct CacheHit
+{
+    IPAddress address;
+    uint32_t  remaining_ttl{0};
+};
+
+class CacheShard final
+{
+public:
+    explicit CacheShard(size_t capacity);
+    CacheShard(CacheShard &&) noexcept = default;
+    CacheShard &operator=(CacheShard &&) noexcept = default;
+    CacheShard(const CacheShard &) = delete;
+    CacheShard &operator=(const CacheShard &) = delete;
+
+    [[nodiscard]] std::optional<CacheHit> get(const CacheKey &key, TimePoint now);
+    void put(CacheKey key, IPAddress address, uint32_t ttl_seconds, TimePoint now);
+
+    [[nodiscard]] size_t size() const noexcept { return index_.size(); }
+    [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
+
+private:
+    struct CacheEntry
     {
-        if (this != &other)
-        {
-            domain = std::move(other.domain);
-            ip     = std::move(other.ip);
-            expiry = other.expiry;
-            chance = other.chance;
-        }
-        return *this;
-    }
+        CacheKey key;
+        IPAddress address;
+        TimePoint expiry;
+        bool      chance{true};
+    };
+
+    using Index = std::unordered_map<CacheKey, size_t, CacheKeyHash>;
+
+    void replace_slot(size_t slot_index, CacheKey key, IPAddress address, TimePoint expiry);
+
+    size_t                                 capacity_{0};
+    size_t                                 hand_{0};
+    std::vector<std::optional<CacheEntry>> entries_;
+    Index                                  index_;
 };
 
 class DNS_Cache final
 {
 public:
-    DNS_Cache(size_t shard_cnt);
-    void                     initialize_thread_shard(int id);
-    std::optional<IPAddress> get(const std::string &domain, const TimePoint &now);
-    void                     put(const std::string &domain, const IPAddress &ip, const TimePoint &now);
+    DNS_Cache(size_t total_capacity, size_t shard_count);
+
+    [[nodiscard]] CacheShard       &shard(size_t worker_id);
+    [[nodiscard]] const CacheShard &shard(size_t worker_id) const;
+    [[nodiscard]] size_t            shard_count() const noexcept { return shards_.size(); }
+    [[nodiscard]] size_t            total_capacity() const noexcept { return total_capacity_; }
 
 private:
-    size_t shard_count{0};
-    struct CacheShard
-    {
-        std::vector<CacheEntry> entries;
-        size_t                  hand{0};
-        Hash_Table              hash_table;
-
-        std::optional<IPAddress> get(const std::string &domain, const TimePoint &now);
-        void                     put(const std::string &domain, const IPAddress &ip, const TimePoint &now);
-        CacheShard();
-    };
-
-    std::vector<std::unique_ptr<CacheShard>> cache_shards; // RAII自动管理，无需手动释放
+    size_t                  total_capacity_{0};
+    std::vector<CacheShard> shards_;
 };
-
 
 } // namespace Cache

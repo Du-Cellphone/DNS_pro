@@ -41,8 +41,11 @@ public:
 
     [[nodiscard]] bool                         is_root() const noexcept { return labels_.empty(); }
     [[nodiscard]] size_t                       wire_size() const noexcept { return wire_size_; }
+    [[nodiscard]] size_t                       label_count() const noexcept { return labels_.size(); }
     [[nodiscard]] std::span<const std::string> labels() const noexcept { return labels_; }
     [[nodiscard]] std::string_view             canonical_key() const noexcept { return canonical_key_; }
+    [[nodiscard]] std::string_view             canonical_label(size_t index) const noexcept;
+    [[nodiscard]] std::string_view             canonical_suffix_key(size_t first_label) const noexcept;
 
     [[nodiscard]] std::string to_string() const;
     [[nodiscard]] std::string to_canonical_string() const;
