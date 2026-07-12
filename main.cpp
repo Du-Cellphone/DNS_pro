@@ -231,10 +231,16 @@
 
 #include "DNS.h"
 
+#include <iostream>
+
 int main()
 {
     DNS dns;
-    dns.init(15, 1);
-    dns.start();
+    if (!dns.init(15, 1) || !dns.start())
+        return 1;
+
+    std::cin.get();
+    dns.request_stop();
+    dns.join();
     return 0;
 }
