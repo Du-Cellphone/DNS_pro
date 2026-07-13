@@ -2,6 +2,8 @@
 
 #include "DNS_Cache.h"
 #include "common/Expected.h"
+#include "runtime/Scheduler.h"
+#include "runtime/Task.h"
 #include "runtime/UniqueFd.h"
 
 #include <cstddef>
@@ -86,7 +88,18 @@ private:
         Wake     = 2,
     };
 
+    struct ClientDatagram
+    {
+        std::vector<std::byte> packet;
+        sockaddr_storage      client_address{};
+        socklen_t             client_length{0};
+        bool                  truncated{false};
+    };
+
     static constexpr size_t kMaximumDatagramSize = 4096;
+    static constexpr size_t kReceiveBudget = 64;
+    static constexpr size_t kReadyBudget = 64;
+    static constexpr size_t kShutdownResumeBudget = 4096;
 
     WorkerLoop(size_t worker_id, Cache::CacheShard &cache_shard)
         : worker_id_(worker_id)
@@ -97,11 +110,7 @@ private:
     Expected<void, WorkerInitError> initialize(uint16_t port);
     void drain_wakeup() const noexcept;
     void drain_listener(std::stop_token stop_token) noexcept;
-    void process_datagram(const std::byte *data,
-                          size_t           size,
-                          const sockaddr  *client_address,
-                          socklen_t        client_length,
-                          bool             truncated) noexcept;
+    runtime::Task<void> process_datagram(ClientDatagram datagram);
     void send_response(const std::vector<std::byte> &response, const sockaddr *client_address, socklen_t client_length) noexcept;
 
     size_t                 worker_id_{0};
@@ -110,7 +119,10 @@ private:
     runtime::UniqueFd      listen_fd_;
     runtime::UniqueFd      epoll_fd_;
     runtime::UniqueFd      wake_fd_;
+    runtime::Scheduler     scheduler_;
     WorkerStats            stats_;
+    mutable std::stop_source stop_source_;
+    bool                   listener_pending_{false};
 };
 
 } // namespace dns::server

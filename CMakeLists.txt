@@ -43,6 +43,7 @@ add_library(dns_core STATIC
     protocol/DnsWriter.cpp
     protocol/DomainName.cpp
     RadixTree.cpp
+    runtime/Scheduler.cpp
     WorkerLoop.cpp
 )
 
@@ -106,4 +107,11 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_reactor_tests)
     add_test(NAME dns_reactor_tests COMMAND dns_reactor_tests)
     set_tests_properties(dns_reactor_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_runtime_tests tests/runtime_tests.cpp)
+    target_link_libraries(dns_runtime_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_runtime_tests)
+    dns_pro_enable_sanitizers(dns_runtime_tests)
+    add_test(NAME dns_runtime_tests COMMAND dns_runtime_tests)
+    set_tests_properties(dns_runtime_tests PROPERTIES TIMEOUT 10)
 endif()

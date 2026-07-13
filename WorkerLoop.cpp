@@ -121,13 +121,32 @@ Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port)
     return {};
 }
 
-void WorkerLoop::run(std::stop_token stop_token) noexcept
+void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
 {
     std::array<epoll_event, 64> events{};
+    std::stop_callback          forward_stop{thread_stop_token, [this] { request_stop(); }};
+    const std::stop_token       stop_token = stop_source_.get_token();
+
+    try
+    {
+        if (!scheduler_.start(stop_token))
+        {
+            ++stats_.internal_errors;
+            std::cerr << "worker " << worker_id_ << " scheduler could not start\n";
+            return;
+        }
+    }
+    catch (const std::exception &error)
+    {
+        ++stats_.internal_errors;
+        std::cerr << "worker " << worker_id_ << " scheduler initialization failed: " << error.what() << '\n';
+        return;
+    }
 
     while (!stop_token.stop_requested())
     {
-        const int ready = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), -1);
+        const int timeout = (listener_pending_ || scheduler_.has_ready()) ? 0 : -1;
+        const int ready = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), timeout);
         if (ready < 0)
         {
             if (errno == EINTR)
@@ -145,13 +164,26 @@ void WorkerLoop::run(std::stop_token stop_token) noexcept
                 continue;
             }
             if (kind == EventKind::Listener)
-                drain_listener(stop_token);
+                listener_pending_ = true;
         }
+
+        if (stop_token.stop_requested())
+            break;
+        if (listener_pending_)
+            drain_listener(stop_token);
+
+        static_cast<void>(scheduler_.run_ready(kReadyBudget));
     }
+
+    static_cast<void>(scheduler_.close());
+    static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
+    stats_.internal_errors +=
+        static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures());
 }
 
 void WorkerLoop::request_stop() const noexcept
 {
+    static_cast<void>(stop_source_.request_stop());
     if (!wake_fd_)
         return;
 
@@ -174,8 +206,9 @@ void WorkerLoop::drain_wakeup() const noexcept
 void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
 {
     std::array<std::byte, kMaximumDatagramSize> buffer{};
+    size_t                                      datagrams = 0;
 
-    while (!stop_token.stop_requested())
+    while (!stop_token.stop_requested() && datagrams < kReceiveBudget)
     {
         sockaddr_storage client_address{};
         iovec            io_vector{buffer.data(), buffer.size()};
@@ -191,32 +224,55 @@ void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                listener_pending_ = false;
                 return;
+            }
             std::cerr << "worker " << worker_id_ << " recvmsg failed: " << std::strerror(errno) << '\n';
+            listener_pending_ = false;
             return;
         }
 
         ++stats_.received_datagrams;
+        ++datagrams;
         const bool truncated = (message.msg_flags & MSG_TRUNC) != 0 || static_cast<size_t>(received) > buffer.size();
         const size_t available = std::min(static_cast<size_t>(received), buffer.size());
-        process_datagram(buffer.data(), available, reinterpret_cast<const sockaddr *>(&client_address), message.msg_namelen, truncated);
+        try
+        {
+            ClientDatagram datagram;
+            datagram.packet.assign(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(available));
+            datagram.client_address = client_address;
+            datagram.client_length = std::min(message.msg_namelen, static_cast<socklen_t>(sizeof(sockaddr_storage)));
+            datagram.truncated = truncated;
+
+            auto task = process_datagram(std::move(datagram));
+            const auto spawned = scheduler_.spawn(std::move(task));
+            if (spawned != runtime::Scheduler::SpawnResult::Spawned && !stop_token.stop_requested())
+                ++stats_.internal_errors;
+        }
+        catch (const std::exception &error)
+        {
+            ++stats_.internal_errors;
+            std::cerr << "worker " << worker_id_ << " failed to own datagram: " << error.what() << '\n';
+        }
     }
+
+    listener_pending_ = !stop_token.stop_requested();
 }
 
-void WorkerLoop::process_datagram(const std::byte *data,
-                                  size_t           size,
-                                  const sockaddr  *client_address,
-                                  socklen_t        client_length,
-                                  bool             truncated) noexcept
+runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
 {
     try
     {
-        const std::span<const std::byte> packet{data, size};
-        DatagramDecision decision = evaluate_datagram(packet, truncated);
+        const auto stop_token = co_await runtime::this_coro::stop_token();
+        if (stop_token.stop_requested())
+            co_return;
+
+        DatagramDecision decision = evaluate_datagram(datagram.packet, datagram.truncated);
         switch (decision.outcome)
         {
             case DatagramOutcome::Dropped:
-                return;
+                co_return;
             case DatagramOutcome::Truncated:
                 ++stats_.truncated_datagrams;
                 break;
@@ -231,17 +287,18 @@ void WorkerLoop::process_datagram(const std::byte *data,
                 break;
             case DatagramOutcome::InternalError:
                 ++stats_.internal_errors;
-                return;
+                co_return;
         }
 
-        if (!decision.response.empty())
-            send_response(decision.response, client_address, client_length);
+        if (!decision.response.empty() && !stop_token.stop_requested())
+            send_response(decision.response, reinterpret_cast<const sockaddr *>(&datagram.client_address), datagram.client_length);
     }
     catch (const std::exception &error)
     {
         ++stats_.internal_errors;
         std::cerr << "worker " << worker_id_ << " failed to process datagram: " << error.what() << '\n';
     }
+    co_return;
 }
 
 void WorkerLoop::send_response(const std::vector<std::byte> &response, const sockaddr *client_address, socklen_t client_length) noexcept
