@@ -20,6 +20,7 @@ enum class ParseErrorCode
     NameTooLong,
     TruncatedCompressionPointer,
     CompressionPointerOutOfBounds,
+    CompressionPointerIntoHeader,
     ForwardCompressionPointer,
     CompressionPointerLoop,
     TooManyCompressionPointers,

@@ -89,6 +89,16 @@ WriteResult serialize_query(const Header &header, std::span<const Question> ques
     return write_question_message(query_header, questions, maximum_size);
 }
 
+Expected<void, WriteError> rewrite_transaction_id(std::span<std::byte> packet, uint16_t transaction_id) noexcept
+{
+    if (packet.size() < sizeof(transaction_id))
+        return write_failure(WriteErrorCode::MissingTransactionId);
+
+    packet[0] = static_cast<std::byte>((transaction_id >> 8U) & 0xffU);
+    packet[1] = static_cast<std::byte>(transaction_id & 0xffU);
+    return {};
+}
+
 WriteResult make_error_response(const Message &request, ResponseCode response_code, bool recursion_available, size_t maximum_size)
 {
     if (request.header.is_response)

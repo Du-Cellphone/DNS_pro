@@ -59,6 +59,8 @@ Expected<DecodedName, ParseError> decode_name(std::span<const std::byte> packet,
                                    static_cast<size_t>(std::to_integer<uint8_t>(packet[position + 1]));
             if (pointer >= packet.size())
                 return parse_failure(ParseErrorCode::CompressionPointerOutOfBounds, position);
+            if (pointer < kDnsHeaderSize)
+                return parse_failure(ParseErrorCode::CompressionPointerIntoHeader, position);
             if (limits.require_backward_pointers && pointer >= position)
                 return parse_failure(ParseErrorCode::ForwardCompressionPointer, position);
             if (std::find(visited_pointers.begin(), visited_pointers.end(), pointer) != visited_pointers.end())

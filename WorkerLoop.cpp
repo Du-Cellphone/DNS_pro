@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <span>
 #include <sys/epoll.h>
@@ -30,49 +31,57 @@ Unexpected<WorkerInitError> init_failure(WorkerInitStep step) noexcept
 
 } // namespace
 
+bool is_valid_upstream_config(const UpstreamConfig &config) noexcept
+{
+    if (config.address.empty() || config.port == 0 || config.query_timeout <= runtime::TimerQueue::Duration::zero() ||
+        config.id_reuse_guard < config.query_timeout || config.transaction_id_capacity == 0 ||
+        config.transaction_id_capacity > dns::upstream::UpstreamChannel::kTransactionIdSpace)
+        return false;
+
+    in_addr address{};
+    return ::inet_pton(AF_INET, config.address.c_str(), &address) == 1;
+}
+
 DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet, bool truncated)
 {
     if (truncated)
     {
         auto format_error = protocol::make_format_error_response(packet);
-        return DatagramDecision{DatagramOutcome::Truncated, format_error ? std::move(*format_error) : std::vector<std::byte>{}};
+        return DatagramDecision{DatagramOutcome::Truncated, format_error ? std::move(*format_error) : std::vector<std::byte>{}, std::nullopt};
     }
 
     auto parsed = protocol::parse_message(packet);
     if (!parsed)
     {
         auto format_error = protocol::make_format_error_response(packet);
-        return DatagramDecision{DatagramOutcome::Malformed, format_error ? std::move(*format_error) : std::vector<std::byte>{}};
+        return DatagramDecision{DatagramOutcome::Malformed, format_error ? std::move(*format_error) : std::vector<std::byte>{}, std::nullopt};
     }
 
     auto query = protocol::validate_mvp_query(*parsed);
     if (!query)
     {
         if (query.error().code == protocol::QueryErrorCode::NotAQuery)
-            return DatagramDecision{DatagramOutcome::Dropped, {}};
+            return DatagramDecision{DatagramOutcome::Dropped, {}, std::nullopt};
 
         auto response = protocol::make_error_response(*parsed, protocol::response_code_for(query.error().code), true, kMaximumDatagramSize);
         if (!response)
-            return DatagramDecision{DatagramOutcome::InternalError, {}};
-        return DatagramDecision{DatagramOutcome::Unsupported, std::move(*response)};
+            return DatagramDecision{DatagramOutcome::InternalError, {}, std::nullopt};
+        return DatagramDecision{DatagramOutcome::Unsupported, std::move(*response), std::nullopt};
     }
 
-    auto response = protocol::make_error_response(*parsed, protocol::ResponseCode::ServFail, true, kMaximumDatagramSize);
-    if (!response)
-        return DatagramDecision{DatagramOutcome::InternalError, {}};
-    return DatagramDecision{DatagramOutcome::Accepted, std::move(*response)};
+    return DatagramDecision{DatagramOutcome::Accepted, {}, std::move(*parsed)};
 }
 
-WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard)
+WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config)
 {
-    auto worker = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard}};
-    auto initialized = worker->initialize(port);
+    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard}};
+    auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
         return dns::unexpected(initialized.error());
     return worker;
 }
 
-Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port)
+Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const UpstreamConfig &upstream_config)
 {
     runtime::UniqueFd listener{::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
     if (!listener)
@@ -84,9 +93,9 @@ Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port)
         return init_failure(WorkerInitStep::ConfigureSocket);
 
     sockaddr_in address{};
-    address.sin_family = AF_INET;
+    address.sin_family      = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(port);
+    address.sin_port        = htons(port);
     if (::bind(listener.get(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0)
         return init_failure(WorkerInitStep::BindSocket);
 
@@ -102,22 +111,56 @@ Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port)
     if (!wake)
         return init_failure(WorkerInitStep::CreateWakeEvent);
 
+    if (!is_valid_upstream_config(upstream_config))
+    {
+        errno = EINVAL;
+        return init_failure(WorkerInitStep::ValidateUpstream);
+    }
+
+    sockaddr_in upstream_address{};
+    upstream_address.sin_family = AF_INET;
+    upstream_address.sin_port   = htons(upstream_config.port);
+    static_cast<void>(::inet_pton(AF_INET, upstream_config.address.c_str(), &upstream_address.sin_addr));
+
+    runtime::UniqueFd upstream_socket{::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
+    if (!upstream_socket)
+        return init_failure(WorkerInitStep::CreateUpstreamSocket);
+    if (::connect(upstream_socket.get(), reinterpret_cast<const sockaddr *>(&upstream_address), sizeof(upstream_address)) < 0)
+        return init_failure(WorkerInitStep::ConnectUpstream);
+
     epoll_event listener_event{};
-    listener_event.events = EPOLLIN | EPOLLET;
+    listener_event.events   = EPOLLIN | EPOLLET;
     listener_event.data.u64 = static_cast<uint64_t>(EventKind::Listener);
     if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, listener.get(), &listener_event) < 0)
         return init_failure(WorkerInitStep::RegisterListener);
 
     epoll_event wake_event{};
-    wake_event.events = EPOLLIN;
+    wake_event.events   = EPOLLIN;
     wake_event.data.u64 = static_cast<uint64_t>(EventKind::Wake);
     if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, wake.get(), &wake_event) < 0)
         return init_failure(WorkerInitStep::RegisterWakeEvent);
 
-    bound_port_ = ntohs(address.sin_port);
-    listen_fd_ = std::move(listener);
-    epoll_fd_ = std::move(epoll);
-    wake_fd_ = std::move(wake);
+    epoll_event upstream_event{};
+    upstream_event.events   = EPOLLIN | EPOLLET;
+    upstream_event.data.u64 = static_cast<uint64_t>(EventKind::Upstream);
+    if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, upstream_socket.get(), &upstream_event) < 0)
+        return init_failure(WorkerInitStep::RegisterUpstream);
+
+    sockaddr_in upstream_local{};
+    socklen_t   upstream_local_length = sizeof(upstream_local);
+    uint16_t    upstream_seed         = static_cast<uint16_t>((worker_id_ * 0x9e37U) & 0xffffU);
+    if (::getsockname(upstream_socket.get(), reinterpret_cast<sockaddr *>(&upstream_local), &upstream_local_length) == 0)
+        upstream_seed ^= ntohs(upstream_local.sin_port);
+
+    bound_port_                                      = ntohs(address.sin_port);
+    listen_fd_                                       = std::move(listener);
+    epoll_fd_                                        = std::move(epoll);
+    wake_fd_                                         = std::move(wake);
+    upstream_fd_                                     = std::move(upstream_socket);
+    upstream_channel_config_.query_timeout           = upstream_config.query_timeout;
+    upstream_channel_config_.id_reuse_guard          = upstream_config.id_reuse_guard;
+    upstream_channel_config_.transaction_id_capacity = upstream_config.transaction_id_capacity;
+    upstream_channel_config_.initial_transaction_id  = upstream_seed;
     return {};
 }
 
@@ -142,18 +185,35 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
             static_cast<void>(scheduler_.shutdown());
             return;
         }
+        if (!upstream_channel_.start(upstream_fd_.get(), scheduler_, timer_queue_, upstream_channel_config_))
+        {
+            ++stats_.internal_errors;
+            std::cerr << "worker " << worker_id_ << " upstream channel could not start\n";
+            static_cast<void>(timer_queue_.close());
+            static_cast<void>(scheduler_.shutdown());
+            static_cast<void>(timer_queue_.stop());
+            return;
+        }
     }
     catch (const std::exception &error)
     {
         ++stats_.internal_errors;
         std::cerr << "worker " << worker_id_ << " scheduler initialization failed: " << error.what() << '\n';
+        static_cast<void>(scheduler_.close());
+        static_cast<void>(upstream_channel_.close());
+        static_cast<void>(timer_queue_.close());
+        static_cast<void>(upstream_channel_.cancel_all());
+        static_cast<void>(timer_queue_.cancel_all());
+        static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
+        static_cast<void>(upstream_channel_.stop());
+        static_cast<void>(timer_queue_.stop());
         return;
     }
 
     while (!stop_token.stop_requested())
     {
         const int timeout =
-            (listener_pending_ || scheduler_.has_ready()) ? 0 : timer_queue_.wait_timeout(runtime::TimerQueue::Clock::now());
+            (listener_pending_ || upstream_pending_ || scheduler_.has_ready()) ? 0 : timer_queue_.wait_timeout(runtime::TimerQueue::Clock::now());
         const int ready = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), timeout);
         if (ready < 0)
         {
@@ -173,12 +233,45 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
             }
             if (kind == EventKind::Listener)
                 listener_pending_ = true;
+            if (kind == EventKind::Upstream)
+            {
+                const uint32_t flags = events[static_cast<size_t>(index)].events;
+                upstream_pending_    = true;
+                upstream_error_pending_ |= (flags & EPOLLERR) != 0;
+                upstream_hangup_pending_ |= (flags & EPOLLHUP) != 0;
+            }
         }
 
         if (stop_token.stop_requested())
             break;
         if (listener_pending_)
             drain_listener(stop_token);
+        if (upstream_pending_)
+        {
+            const auto drained = upstream_channel_.drain(kUpstreamReceiveBudget);
+            upstream_pending_  = drained.has_more;
+        }
+        if (upstream_error_pending_ || upstream_hangup_pending_)
+        {
+            const bool hangup       = upstream_hangup_pending_;
+            int        socket_error = 0;
+            socklen_t  error_length = sizeof(socket_error);
+            if (::getsockopt(upstream_fd_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &error_length) < 0)
+                socket_error = errno;
+            if (socket_error == 0 && upstream_hangup_pending_)
+                socket_error = ECONNRESET;
+
+            upstream_error_pending_  = false;
+            upstream_hangup_pending_ = false;
+            if (socket_error != 0)
+                static_cast<void>(upstream_channel_.fail_all(dns::upstream::QueryOutcome::SocketError, socket_error));
+            if (hangup)
+            {
+                upstream_usable_  = false;
+                upstream_pending_ = false;
+                upstream_fd_.reset();
+            }
+        }
 
         static_cast<void>(timer_queue_.expire(runtime::TimerQueue::Clock::now(), kTimerBudget));
         static_cast<void>(scheduler_.run_ready(kReadyBudget));
@@ -187,14 +280,28 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
     // close() rejects new roots but deliberately leaves schedule() available,
     // allowing cancelled timer waiters to enter the ready queue and unwind.
     static_cast<void>(scheduler_.close());
+    static_cast<void>(upstream_channel_.close());
     static_cast<void>(timer_queue_.close());
+    static_cast<void>(upstream_channel_.cancel_all());
     static_cast<void>(timer_queue_.cancel_all());
     static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
+    if (!upstream_channel_.stop())
+        ++stats_.internal_errors;
     if (!timer_queue_.stop())
         ++stats_.internal_errors;
-    stats_.internal_errors +=
-        static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures() +
-                              timer_queue_.invariant_failures());
+
+    const auto &upstream_stats          = upstream_channel_.stats();
+    stats_.upstream_queries             = upstream_stats.queries_sent;
+    stats_.upstream_responses           = upstream_stats.responses_completed;
+    stats_.upstream_timeouts            = upstream_stats.timeouts;
+    stats_.upstream_cancellations       = upstream_stats.cancellations;
+    stats_.upstream_send_errors         = upstream_stats.send_errors;
+    stats_.upstream_socket_errors       = upstream_stats.socket_errors;
+    stats_.upstream_overloaded          = upstream_stats.overloaded;
+    stats_.upstream_invalid_responses   = upstream_stats.invalid_responses;
+    stats_.upstream_unmatched_responses = upstream_stats.unmatched_responses;
+    stats_.internal_errors += static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures() +
+                                                    timer_queue_.invariant_failures() + upstream_stats.invariant_failures);
 }
 
 void WorkerLoop::request_stop() const noexcept
@@ -229,10 +336,10 @@ void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
         sockaddr_storage client_address{};
         iovec            io_vector{buffer.data(), buffer.size()};
         msghdr           message{};
-        message.msg_name = &client_address;
+        message.msg_name    = &client_address;
         message.msg_namelen = sizeof(client_address);
-        message.msg_iov = &io_vector;
-        message.msg_iovlen = 1;
+        message.msg_iov     = &io_vector;
+        message.msg_iovlen  = 1;
 
         const ssize_t received = ::recvmsg(listen_fd_.get(), &message, MSG_TRUNC);
         if (received < 0)
@@ -251,17 +358,17 @@ void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
 
         ++stats_.received_datagrams;
         ++datagrams;
-        const bool truncated = (message.msg_flags & MSG_TRUNC) != 0 || static_cast<size_t>(received) > buffer.size();
+        const bool   truncated = (message.msg_flags & MSG_TRUNC) != 0 || static_cast<size_t>(received) > buffer.size();
         const size_t available = std::min(static_cast<size_t>(received), buffer.size());
         try
         {
             ClientDatagram datagram;
             datagram.packet.assign(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(available));
             datagram.client_address = client_address;
-            datagram.client_length = std::min(message.msg_namelen, static_cast<socklen_t>(sizeof(sockaddr_storage)));
-            datagram.truncated = truncated;
+            datagram.client_length  = std::min(message.msg_namelen, static_cast<socklen_t>(sizeof(sockaddr_storage)));
+            datagram.truncated      = truncated;
 
-            auto task = process_datagram(std::move(datagram));
+            auto       task    = process_datagram(std::move(datagram));
             const auto spawned = scheduler_.spawn(std::move(task));
             if (spawned != runtime::Scheduler::SpawnResult::Spawned && !stop_token.stop_requested())
                 ++stats_.internal_errors;
@@ -304,6 +411,32 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
             case DatagramOutcome::InternalError:
                 ++stats_.internal_errors;
                 co_return;
+        }
+
+        if (decision.outcome == DatagramOutcome::Accepted)
+        {
+            if (!decision.request || decision.request->questions.size() != 1)
+            {
+                ++stats_.internal_errors;
+                co_return;
+            }
+
+            if (upstream_usable_)
+            {
+                auto upstream_result = co_await upstream_channel_.query(decision.request->header, decision.request->questions.front());
+                if (upstream_result.outcome == dns::upstream::QueryOutcome::Response)
+                    decision.response = std::move(upstream_result.response);
+            }
+            if (decision.response.empty())
+            {
+                auto servfail = protocol::make_error_response(*decision.request, protocol::ResponseCode::ServFail, true, kMaximumDatagramSize);
+                if (!servfail)
+                {
+                    ++stats_.internal_errors;
+                    co_return;
+                }
+                decision.response = std::move(*servfail);
+            }
         }
 
         if (!decision.response.empty() && !stop_token.stop_requested())

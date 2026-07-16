@@ -40,11 +40,13 @@ add_library(dns_core STATIC
     DomainBlocklist.cpp
     protocol/DnsParser.cpp
     protocol/DnsQuery.cpp
+    protocol/DnsResponse.cpp
     protocol/DnsWriter.cpp
     protocol/DomainName.cpp
     RadixTree.cpp
     runtime/Scheduler.cpp
     runtime/TimerQueue.cpp
+    upstream/UpstreamChannel.cpp
     WorkerLoop.cpp
 )
 
@@ -122,4 +124,11 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_timer_tests)
     add_test(NAME dns_timer_tests COMMAND dns_timer_tests)
     set_tests_properties(dns_timer_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_upstream_tests tests/upstream_tests.cpp)
+    target_link_libraries(dns_upstream_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_upstream_tests)
+    dns_pro_enable_sanitizers(dns_upstream_tests)
+    add_test(NAME dns_upstream_tests COMMAND dns_upstream_tests)
+    set_tests_properties(dns_upstream_tests PROPERTIES TIMEOUT 10)
 endif()

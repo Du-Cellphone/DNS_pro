@@ -55,6 +55,7 @@ canonical QNAME + QTYPE + QCLASS
 
 - 每个 worker 独占自己的 cache shard 和 pending-query table，热路径不依赖跨 worker 锁。
 - 上游 transaction ID 在 worker 自己的上游 socket 命名空间内分配。
+- transaction ID 从随机化的空闲池分配；完成后的 ID 至少隔离一个查询超时窗口后才可复用。重复或迟到响应在该隔离窗口内不得命中新查询；窗口之外的无限迟到包不属于 UDP DNS 能够提供的保证。
 - 协程只能由所属 worker 的 scheduler 恢复。
 - 响应、超时、取消和网络错误只能有一个成为等待操作的最终完成原因。
 - coroutine frame、文件描述符、定时器和 pending query 必须具有明确且可测试的 owner。

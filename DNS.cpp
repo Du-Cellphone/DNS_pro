@@ -15,7 +15,8 @@ bool DNS::init(const DNSConfig &config)
     std::scoped_lock lock{lifecycle_mutex_};
     if (state_ == State::Running || state_ == State::Stopping)
         return false;
-    if (config.worker_count == 0 || config.manager_count > 1 || (config.port == 0 && config.worker_count > 1))
+    if (config.worker_count == 0 || config.manager_count > 1 || (config.port == 0 && config.worker_count > 1) ||
+        !dns::server::is_valid_upstream_config(config.upstream))
         return false;
 
     try
@@ -56,7 +57,7 @@ bool DNS::start()
     {
         for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id)
         {
-            auto loop = dns::server::WorkerLoop::create(worker_id, config_.port, cache_->shard(worker_id));
+            auto loop = dns::server::WorkerLoop::create(worker_id, config_.port, cache_->shard(worker_id), config_.upstream);
             if (!loop)
             {
                 std::cerr << "failed to initialize worker " << worker_id << " at step " << static_cast<int>(loop.error().step)

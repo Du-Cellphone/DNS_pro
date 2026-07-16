@@ -17,41 +17,61 @@ namespace dns::runtime
 class TimerQueue;
 class SleepAwaiter;
 
-namespace detail
+enum class TimerCompletion : uint8_t
 {
-
-enum class TimerState : uint8_t
-{
-    Idle,
-    Armed,
     Expired,
     Cancelled,
-    Failed,
 };
 
-struct TimerNode final
+// A TimerRegistration is embedded in the object whose lifetime is guarded by
+// a deadline. TimerQueue only borrows its address while armed; an armed owner
+// must be destroyed or explicitly disarmed on the queue's owner thread.
+class TimerRegistration final
 {
+public:
+    TimerRegistration() = default;
+    ~TimerRegistration();
+
+    TimerRegistration(const TimerRegistration &)            = delete;
+    TimerRegistration &operator=(const TimerRegistration &) = delete;
+    TimerRegistration(TimerRegistration &&)                 = delete;
+    TimerRegistration &operator=(TimerRegistration &&)      = delete;
+
+    [[nodiscard]] bool armed() const noexcept { return owner_ != nullptr; }
+
+private:
+    friend class TimerQueue;
+
     static constexpr size_t not_in_heap = std::numeric_limits<size_t>::max();
 
-    TimerQueue                           *owner{nullptr};
-    TaskPromiseBase                      *task{nullptr};
-    std::chrono::steady_clock::time_point deadline{};
-    uint64_t                              sequence{0};
-    size_t                                heap_index{not_in_heap};
-    TimerState                            state{TimerState::Idle};
+    TimerQueue                           *owner_{nullptr};
+    std::chrono::steady_clock::time_point deadline_{};
+    uint64_t                              sequence_{0};
+    size_t                                heap_index_{not_in_heap};
+    bool (*completion_)(void *, TimerCompletion) noexcept {nullptr};
+    void *context_{nullptr};
 };
 
-} // namespace detail
-
-// TimerQueue is single-threaded and scheduler-affine after start(). It only
-// borrows TimerNode objects embedded in suspended coroutine frames; Scheduler
-// remains the sole owner of those frames.
+// TimerQueue is single-threaded and scheduler-affine after start(). Expiry and
+// cancellation detach registrations before invoking their callbacks, so a
+// callback may enqueue owner-thread work without leaving a stale heap pointer.
 class TimerQueue final
 {
 public:
-    using Clock     = std::chrono::steady_clock;
-    using TimePoint = Clock::time_point;
-    using Duration  = Clock::duration;
+    using Clock              = std::chrono::steady_clock;
+    using TimePoint          = Clock::time_point;
+    using Duration           = Clock::duration;
+    using CompletionCallback = bool (*)(void *, TimerCompletion) noexcept;
+
+    enum class ArmResult : uint8_t
+    {
+        Armed,
+        NotRunning,
+        Closed,
+        WrongThread,
+        AlreadyArmed,
+        InvalidCallback,
+    };
 
     struct DispatchResult
     {
@@ -74,9 +94,11 @@ public:
     // started again. Call close()/cancel_all() and reclaim frames first.
     [[nodiscard]] bool stop() noexcept;
 
-    // Due/cancelled operations are enqueued on Scheduler and never resumed
-    // inline. The budget counts timers removed from the heap, including a
-    // timer whose Scheduler enqueue reports an invariant failure.
+    [[nodiscard]] ArmResult arm(TimerRegistration &registration, TimePoint deadline, CompletionCallback completion, void *context);
+    [[nodiscard]] bool      disarm(TimerRegistration &registration) noexcept;
+
+    // Due/cancelled registrations are detached and their callbacks invoked;
+    // callbacks must enqueue rather than inline-resume coroutine frames.
     [[nodiscard]] DispatchResult expire(TimePoint now, size_t budget = std::numeric_limits<size_t>::max()) noexcept;
     [[nodiscard]] DispatchResult cancel_all() noexcept;
 
@@ -88,6 +110,7 @@ public:
     [[nodiscard]] SleepAwaiter sleep_until(TimePoint deadline) noexcept;
     [[nodiscard]] SleepAwaiter sleep_for(Duration delay) noexcept;
 
+    [[nodiscard]] bool   is_bound_to(const Scheduler &scheduler) const noexcept { return running_ && scheduler_ == &scheduler; }
     [[nodiscard]] bool   running() const noexcept { return running_; }
     [[nodiscard]] bool   accepting() const noexcept { return accepting_; }
     [[nodiscard]] bool   empty() const noexcept { return heap_.empty(); }
@@ -95,30 +118,19 @@ public:
     [[nodiscard]] size_t invariant_failures() const noexcept { return invariant_failures_; }
 
 private:
-    friend class SleepAwaiter;
+    friend class TimerRegistration;
 
-    enum class ArmResult : uint8_t
-    {
-        Armed,
-        NotRunning,
-        Closed,
-        WrongThread,
-        WrongScheduler,
-        InvalidNode,
-    };
+    void abandon(TimerRegistration &registration) noexcept;
+    void complete_front(TimerCompletion completion, DispatchResult &result) noexcept;
 
-    [[nodiscard]] ArmResult arm(detail::TimerNode &node, detail::TaskPromiseBase &task, TimePoint deadline);
-    void                    abandon(detail::TimerNode &node) noexcept;
-    void                    complete_front(detail::TimerState completion, DispatchResult &result) noexcept;
-
-    [[nodiscard]] static bool        earlier(const detail::TimerNode &left, const detail::TimerNode &right) noexcept;
+    [[nodiscard]] static bool        earlier(const TimerRegistration &left, const TimerRegistration &right) noexcept;
     void                             swap_nodes(size_t left, size_t right) noexcept;
     void                             sift_up(size_t index) noexcept;
     void                             sift_down(size_t index) noexcept;
-    [[nodiscard]] detail::TimerNode *remove_at(size_t index) noexcept;
+    [[nodiscard]] TimerRegistration *remove_at(size_t index) noexcept;
     [[nodiscard]] bool               on_owner_thread() const noexcept;
 
-    std::vector<detail::TimerNode *> heap_;
+    std::vector<TimerRegistration *> heap_;
     Scheduler                       *scheduler_{nullptr};
     std::thread::id                  owner_thread_{};
     uint64_t                         next_sequence_{0};
@@ -136,8 +148,6 @@ public:
     {
     }
 
-    ~SleepAwaiter();
-
     SleepAwaiter(const SleepAwaiter &)            = delete;
     SleepAwaiter &operator=(const SleepAwaiter &) = delete;
     SleepAwaiter(SleepAwaiter &&)                 = delete;
@@ -151,22 +161,31 @@ public:
         auto &task = static_cast<detail::TaskPromiseBase &>(handle.promise());
         if (task.scheduler() == nullptr)
         {
-            node_.state = detail::TimerState::Failed;
-            error_      = "sleeping coroutine is not bound to a scheduler";
+            state_ = State::Failed;
+            error_ = "sleeping coroutine is not bound to a scheduler";
             return false;
         }
         if (task.stop_token().stop_requested())
         {
-            node_.state = detail::TimerState::Cancelled;
+            state_ = State::Cancelled;
+            return false;
+        }
+        if (!queue_->is_bound_to(*task.scheduler()))
+        {
+            state_ = State::Failed;
+            error_ = "timer queue belongs to another scheduler";
             return false;
         }
 
-        switch (queue_->arm(node_, task, deadline_))
+        task_  = &task;
+        state_ = State::Pending;
+        switch (queue_->arm(registration_, deadline_, &SleepAwaiter::complete, this))
         {
             case TimerQueue::ArmResult::Armed:
                 return true;
             case TimerQueue::ArmResult::Closed:
-                node_.state = detail::TimerState::Cancelled;
+                task_  = nullptr;
+                state_ = State::Cancelled;
                 return false;
             case TimerQueue::ArmResult::NotRunning:
                 error_ = "timer queue is not running";
@@ -174,26 +193,39 @@ public:
             case TimerQueue::ArmResult::WrongThread:
                 error_ = "timer queue used from a non-owner thread";
                 break;
-            case TimerQueue::ArmResult::WrongScheduler:
-                error_ = "timer queue belongs to another scheduler";
-                break;
-            case TimerQueue::ArmResult::InvalidNode:
+            case TimerQueue::ArmResult::AlreadyArmed:
                 error_ = "timer awaiter cannot be armed more than once";
+                break;
+            case TimerQueue::ArmResult::InvalidCallback:
+                error_ = "timer completion callback is invalid";
                 break;
         }
 
-        if (node_.state == detail::TimerState::Idle)
-            node_.state = detail::TimerState::Failed;
+        task_  = nullptr;
+        state_ = State::Failed;
         return false;
     }
 
     void await_resume() const;
 
 private:
-    TimerQueue           *queue_{nullptr};
-    TimerQueue::TimePoint deadline_{};
-    detail::TimerNode     node_{};
-    const char           *error_{nullptr};
+    enum class State : uint8_t
+    {
+        Idle,
+        Pending,
+        Expired,
+        Cancelled,
+        Failed,
+    };
+
+    [[nodiscard]] static bool complete(void *context, TimerCompletion completion) noexcept;
+
+    TimerQueue              *queue_{nullptr};
+    TimerQueue::TimePoint    deadline_{};
+    TimerRegistration        registration_{};
+    detail::TaskPromiseBase *task_{nullptr};
+    const char              *error_{nullptr};
+    State                    state_{State::Idle};
 };
 
 inline SleepAwaiter TimerQueue::sleep_until(TimePoint deadline) noexcept

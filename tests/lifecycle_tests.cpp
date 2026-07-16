@@ -2,6 +2,7 @@
 #include "runtime/UniqueFd.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
@@ -60,6 +61,11 @@ void test_service_configuration_and_stop()
     invalid.worker_count = 1;
     invalid.manager_count = 2;
     require(!service.init(invalid), "more than one control-plane manager must be rejected in the MVP");
+
+    invalid.manager_count = 1;
+    invalid.upstream.query_timeout = std::chrono::seconds{2};
+    invalid.upstream.id_reuse_guard = std::chrono::seconds{1};
+    require(!service.init(invalid), "the transaction-ID reuse guard must cover at least one upstream timeout window");
 
     DNSConfig config;
     config.worker_count = 1;

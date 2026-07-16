@@ -1,5 +1,6 @@
 #include "protocol/DnsParser.h"
 #include "protocol/DnsQuery.h"
+#include "protocol/DnsResponse.h"
 #include "protocol/DnsWriter.h"
 #include "protocol/DomainName.h"
 
@@ -191,6 +192,88 @@ void test_query_parse_write_roundtrip()
     require(root_parsed && root_parsed->questions.front().name.is_root(), "a root-domain query must round-trip");
 }
 
+
+void test_transaction_id_rewrite()
+{
+    const auto original = compressed_a_response();
+    auto       rewritten = original;
+
+    auto result = rewrite_transaction_id(rewritten, 0xbeef);
+    require(result.has_value(), "a complete DNS packet must allow its transaction ID to be rewritten");
+    require(transaction_id(rewritten) == std::optional<uint16_t>{0xbeef}, "the rewritten transaction ID must use network byte order");
+    require(rewritten[0] == std::byte{0xbe} && rewritten[1] == std::byte{0xef}, "transaction ID bytes must be written most significant byte first");
+
+    rewritten[0] = original[0];
+    rewritten[1] = original[1];
+    require(rewritten == original, "rewriting a transaction ID must not alter any other wire byte");
+
+    auto one_byte = bytes({0x12});
+    const auto unchanged = one_byte;
+    auto missing_id = rewrite_transaction_id(one_byte, 0x3456);
+    require(!missing_id && missing_id.error().code == WriteErrorCode::MissingTransactionId,
+            "a packet shorter than two bytes must reject transaction ID rewriting");
+    require(one_byte == unchanged, "a failed transaction ID rewrite must not partially modify its input");
+    require(!transaction_id(one_byte), "reading a transaction ID must reject a packet shorter than two bytes");
+}
+
+void test_upstream_response_validation()
+{
+    auto response = parse_message(compressed_a_response());
+    require(response.has_value(), "upstream response validation fixture must parse");
+    const Question expected_question = response->questions.front();
+
+    auto valid = validate_upstream_response(*response, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question);
+    require(valid.has_value(), "a correlated upstream response must pass validation");
+
+    Message different_case = *response;
+    auto uppercase_name = DomainName::from_text("EXAMPLE.COM");
+    require(uppercase_name.has_value(), "case-insensitive response validation fixture must be valid");
+    different_case.questions.front().name = std::move(*uppercase_name);
+    require(validate_upstream_response(different_case, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question).has_value(),
+            "question association must use DNS case-insensitive name equality");
+
+    Message legal_response_flags = *response;
+    legal_response_flags.header.authoritative_answer = true;
+    legal_response_flags.header.truncated = true;
+    legal_response_flags.header.authenticated_data = true;
+    legal_response_flags.header.checking_disabled = true;
+    legal_response_flags.header.response_code = static_cast<uint8_t>(ResponseCode::NxDomain);
+    require(validate_upstream_response(legal_response_flags, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question).has_value(),
+            "association validation must not reject legal response-only flags or non-success RCODEs");
+
+    Message not_a_response = *response;
+    not_a_response.header.is_response = false;
+    auto not_response = validate_upstream_response(not_a_response, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question);
+    require(!not_response && not_response.error().code == ResponseValidationErrorCode::NotAResponse,
+            "a query packet must not complete an upstream response wait");
+
+    auto wrong_id = validate_upstream_response(*response, 0x4321, static_cast<uint8_t>(Opcode::Query), expected_question);
+    require(!wrong_id && wrong_id.error().code == ResponseValidationErrorCode::WrongTransactionId,
+            "an upstream response with another transaction ID must be rejected");
+
+    auto wrong_opcode = validate_upstream_response(*response, 0x1234, static_cast<uint8_t>(Opcode::Status), expected_question);
+    require(!wrong_opcode && wrong_opcode.error().code == ResponseValidationErrorCode::WrongOpcode,
+            "an upstream response with another opcode must be rejected");
+
+    Message reserved_flag = *response;
+    reserved_flag.header.reserved_z = true;
+    auto invalid_flags = validate_upstream_response(reserved_flag, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question);
+    require(!invalid_flags && invalid_flags.error().code == ResponseValidationErrorCode::InvalidHeaderFlags,
+            "an upstream response with the reserved header bit set must be rejected");
+
+    Message no_question = *response;
+    no_question.questions.clear();
+    auto wrong_count = validate_upstream_response(no_question, 0x1234, static_cast<uint8_t>(Opcode::Query), expected_question);
+    require(!wrong_count && wrong_count.error().code == ResponseValidationErrorCode::WrongQuestionCount,
+            "an upstream response must echo exactly one question");
+
+    Question mismatched_question = expected_question;
+    mismatched_question.type = static_cast<uint16_t>(RecordType::AAAA);
+    auto mismatch = validate_upstream_response(*response, 0x1234, static_cast<uint8_t>(Opcode::Query), mismatched_question);
+    require(!mismatch && mismatch.error().code == ResponseValidationErrorCode::QuestionMismatch,
+            "an upstream response must match the pending question tuple");
+}
+
 void test_compression_and_resource_records()
 {
     auto parsed = parse_message(compressed_a_response());
@@ -247,6 +330,14 @@ void test_compression_and_resource_records()
 
 void test_compression_failures()
 {
+    auto pointer_into_header = bytes({
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc0, 0x00, 0x00, 0x01, 0x00, 0x01,
+    });
+    auto header_pointer_result = parse_message(pointer_into_header);
+    require(!header_pointer_result && header_pointer_result.error().code == ParseErrorCode::CompressionPointerIntoHeader,
+            "a compression pointer into the DNS header must be rejected before transaction ID rewriting can change name semantics");
+
     auto self_loop = bytes({
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01,
@@ -472,6 +563,8 @@ int main()
     test_header_and_big_endian_fields();
     test_domain_name_model();
     test_query_parse_write_roundtrip();
+    test_transaction_id_rewrite();
+    test_upstream_response_validation();
     test_compression_and_resource_records();
     test_compression_failures();
     test_truncation_counts_and_limits();

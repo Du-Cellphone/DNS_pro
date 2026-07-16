@@ -26,6 +26,7 @@ struct DNSConfig
     size_t   manager_count{1};
     size_t   cache_capacity{Cache::DEFAULT_TOTAL_CAPACITY};
     uint16_t port{5353};
+    dns::server::UpstreamConfig upstream{};
 };
 
 class DNS final

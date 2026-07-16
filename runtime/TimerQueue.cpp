@@ -3,21 +3,29 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <exception>
 #include <stdexcept>
+#include <utility>
 
 namespace dns::runtime
 {
 
+TimerRegistration::~TimerRegistration()
+{
+    if (owner_ != nullptr)
+        owner_->abandon(*this);
+}
+
 TimerQueue::~TimerQueue()
 {
-    // Destruction cannot cooperatively resume tasks. Detaching every borrowed
-    // node makes later coroutine-frame destruction safe even if the documented
-    // TimerQueue-before-Scheduler member order was not followed.
+    // Destruction cannot cooperatively invoke callbacks. Detaching every
+    // borrowed registration makes later owner destruction safe in either
+    // member order, although normal shutdown completes registrations first.
     while (!heap_.empty())
     {
-        detail::TimerNode *node = remove_at(0);
-        node->task              = nullptr;
-        node->state             = detail::TimerState::Cancelled;
+        TimerRegistration *registration = remove_at(0);
+        registration->completion_       = nullptr;
+        registration->context_          = nullptr;
     }
 }
 
@@ -57,16 +65,60 @@ bool TimerQueue::stop() noexcept
     return true;
 }
 
+TimerQueue::ArmResult TimerQueue::arm(TimerRegistration &registration, TimePoint deadline, CompletionCallback completion, void *context)
+{
+    if (!running_)
+        return ArmResult::NotRunning;
+    if (!on_owner_thread())
+        return ArmResult::WrongThread;
+    if (!accepting_)
+        return ArmResult::Closed;
+    if (registration.owner_ != nullptr || registration.heap_index_ != TimerRegistration::not_in_heap)
+        return ArmResult::AlreadyArmed;
+    if (completion == nullptr)
+        return ArmResult::InvalidCallback;
+
+    registration.deadline_ = deadline;
+    registration.sequence_ = next_sequence_++;
+
+    const size_t index = heap_.size();
+    heap_.push_back(&registration);
+    registration.owner_      = this;
+    registration.heap_index_ = index;
+    registration.completion_ = completion;
+    registration.context_    = context;
+    sift_up(index);
+    return ArmResult::Armed;
+}
+
+bool TimerQueue::disarm(TimerRegistration &registration) noexcept
+{
+    if (!running_ || !on_owner_thread() || registration.owner_ != this)
+        return false;
+
+    const size_t index = registration.heap_index_;
+    if (index >= heap_.size() || heap_[index] != &registration)
+    {
+        ++invariant_failures_;
+        return false;
+    }
+
+    static_cast<void>(remove_at(index));
+    registration.completion_ = nullptr;
+    registration.context_    = nullptr;
+    return true;
+}
+
 TimerQueue::DispatchResult TimerQueue::expire(TimePoint now, size_t budget) noexcept
 {
     DispatchResult result;
     if (!running_ || !on_owner_thread())
         return result;
 
-    while (result.dispatched < budget && !heap_.empty() && heap_.front()->deadline <= now)
-        complete_front(detail::TimerState::Expired, result);
+    while (result.dispatched < budget && !heap_.empty() && heap_.front()->deadline_ <= now)
+        complete_front(TimerCompletion::Expired, result);
 
-    result.has_due = !heap_.empty() && heap_.front()->deadline <= now;
+    result.has_due = !heap_.empty() && heap_.front()->deadline_ <= now;
     return result;
 }
 
@@ -77,7 +129,7 @@ TimerQueue::DispatchResult TimerQueue::cancel_all() noexcept
         return result;
 
     while (!heap_.empty())
-        complete_front(detail::TimerState::Cancelled, result);
+        complete_front(TimerCompletion::Cancelled, result);
     return result;
 }
 
@@ -86,7 +138,7 @@ int TimerQueue::wait_timeout(TimePoint now) const noexcept
     if (heap_.empty())
         return -1;
 
-    const TimePoint deadline = heap_.front()->deadline;
+    const TimePoint deadline = heap_.front()->deadline_;
     if (deadline <= now)
         return 0;
 
@@ -117,50 +169,26 @@ std::optional<TimerQueue::TimePoint> TimerQueue::next_deadline() const noexcept
 {
     if (heap_.empty())
         return std::nullopt;
-    return heap_.front()->deadline;
+    return heap_.front()->deadline_;
 }
 
-TimerQueue::ArmResult TimerQueue::arm(detail::TimerNode &node, detail::TaskPromiseBase &task, TimePoint deadline)
+void TimerQueue::abandon(TimerRegistration &registration) noexcept
 {
-    if (!running_)
-        return ArmResult::NotRunning;
-    if (!on_owner_thread())
-        return ArmResult::WrongThread;
-    if (!accepting_)
-        return ArmResult::Closed;
-    if (task.scheduler() != scheduler_)
-        return ArmResult::WrongScheduler;
-    if (node.state != detail::TimerState::Idle || node.owner != nullptr || node.heap_index != detail::TimerNode::not_in_heap)
-        return ArmResult::InvalidNode;
-
-    node.deadline = deadline;
-    node.sequence = next_sequence_++;
-    node.task     = &task;
-
-    const size_t index = heap_.size();
-    heap_.push_back(&node);
-    node.owner      = this;
-    node.heap_index = index;
-    node.state      = detail::TimerState::Armed;
-    sift_up(index);
-    return ArmResult::Armed;
-}
-
-void TimerQueue::abandon(detail::TimerNode &node) noexcept
-{
-    if (node.state != detail::TimerState::Armed || node.owner != this)
+    if (registration.owner_ != this)
         return;
+    if (running_ && !on_owner_thread())
+        std::terminate();
 
-    size_t index = node.heap_index;
-    if (index >= heap_.size() || heap_[index] != &node)
+    size_t index = registration.heap_index_;
+    if (index >= heap_.size() || heap_[index] != &registration)
     {
-        const auto found = std::find(heap_.begin(), heap_.end(), &node);
+        const auto found = std::find(heap_.begin(), heap_.end(), &registration);
         if (found == heap_.end())
         {
-            node.owner      = nullptr;
-            node.task       = nullptr;
-            node.heap_index = detail::TimerNode::not_in_heap;
-            node.state      = detail::TimerState::Cancelled;
+            registration.owner_      = nullptr;
+            registration.heap_index_ = TimerRegistration::not_in_heap;
+            registration.completion_ = nullptr;
+            registration.context_    = nullptr;
             ++invariant_failures_;
             return;
         }
@@ -169,37 +197,38 @@ void TimerQueue::abandon(detail::TimerNode &node) noexcept
     }
 
     static_cast<void>(remove_at(index));
-    node.task  = nullptr;
-    node.state = detail::TimerState::Cancelled;
+    registration.completion_ = nullptr;
+    registration.context_    = nullptr;
 }
 
-void TimerQueue::complete_front(detail::TimerState completion, DispatchResult &result) noexcept
+void TimerQueue::complete_front(TimerCompletion completion, DispatchResult &result) noexcept
 {
-    detail::TimerNode       *node = remove_at(0);
-    detail::TaskPromiseBase *task = node->task;
-    node->task                    = nullptr;
-    node->state                   = completion;
+    TimerRegistration       *registration = remove_at(0);
+    const CompletionCallback callback     = std::exchange(registration->completion_, nullptr);
+    void                    *context      = std::exchange(registration->context_, nullptr);
     ++result.dispatched;
 
-    if (scheduler_ == nullptr || task == nullptr || scheduler_->schedule(*task) != Scheduler::ScheduleResult::Scheduled)
+    // The callback may make the registration's owner eligible for destruction;
+    // do not access registration after this call.
+    if (callback == nullptr || !callback(context, completion))
     {
         ++result.schedule_failures;
         ++invariant_failures_;
     }
 }
 
-bool TimerQueue::earlier(const detail::TimerNode &left, const detail::TimerNode &right) noexcept
+bool TimerQueue::earlier(const TimerRegistration &left, const TimerRegistration &right) noexcept
 {
-    if (left.deadline != right.deadline)
-        return left.deadline < right.deadline;
-    return left.sequence < right.sequence;
+    if (left.deadline_ != right.deadline_)
+        return left.deadline_ < right.deadline_;
+    return left.sequence_ < right.sequence_;
 }
 
 void TimerQueue::swap_nodes(size_t left, size_t right) noexcept
 {
     std::swap(heap_[left], heap_[right]);
-    heap_[left]->heap_index  = left;
-    heap_[right]->heap_index = right;
+    heap_[left]->heap_index_  = left;
+    heap_[right]->heap_index_ = right;
 }
 
 void TimerQueue::sift_up(size_t index) noexcept
@@ -234,24 +263,24 @@ void TimerQueue::sift_down(size_t index) noexcept
     }
 }
 
-detail::TimerNode *TimerQueue::remove_at(size_t index) noexcept
+TimerRegistration *TimerQueue::remove_at(size_t index) noexcept
 {
-    detail::TimerNode *removed = heap_[index];
-    detail::TimerNode *tail    = heap_.back();
+    TimerRegistration *removed = heap_[index];
+    TimerRegistration *tail    = heap_.back();
     heap_.pop_back();
 
     if (index < heap_.size())
     {
-        heap_[index]     = tail;
-        tail->heap_index = index;
+        heap_[index]      = tail;
+        tail->heap_index_ = index;
         if (index != 0 && earlier(*heap_[index], *heap_[(index - 1) / 2]))
             sift_up(index);
         else
             sift_down(index);
     }
 
-    removed->owner      = nullptr;
-    removed->heap_index = detail::TimerNode::not_in_heap;
+    removed->owner_      = nullptr;
+    removed->heap_index_ = TimerRegistration::not_in_heap;
     return removed;
 }
 
@@ -260,27 +289,27 @@ bool TimerQueue::on_owner_thread() const noexcept
     return running_ && owner_thread_ == std::this_thread::get_id();
 }
 
-SleepAwaiter::~SleepAwaiter()
+bool SleepAwaiter::complete(void *context, TimerCompletion completion) noexcept
 {
-    // TimerQueue destruction first marks every borrowed node Cancelled and
-    // clears owner, so this test must happen before dereferencing an owner.
-    if (node_.state == detail::TimerState::Armed && node_.owner != nullptr)
-        node_.owner->abandon(node_);
+    auto                    &awaiter = *static_cast<SleepAwaiter *>(context);
+    detail::TaskPromiseBase *task    = std::exchange(awaiter.task_, nullptr);
+    awaiter.state_                   = completion == TimerCompletion::Expired ? State::Expired : State::Cancelled;
+    return task != nullptr && task->scheduler() != nullptr && task->scheduler()->schedule(*task) == Scheduler::ScheduleResult::Scheduled;
 }
 
 void SleepAwaiter::await_resume() const
 {
-    switch (node_.state)
+    switch (state_)
     {
-        case detail::TimerState::Expired:
+        case State::Expired:
             return;
-        case detail::TimerState::Cancelled:
+        case State::Cancelled:
             throw OperationCancelled{};
-        case detail::TimerState::Failed:
+        case State::Failed:
             throw std::logic_error{error_ != nullptr ? error_ : "timer operation failed"};
-        case detail::TimerState::Idle:
+        case State::Idle:
             throw std::logic_error{"timer operation was never armed"};
-        case detail::TimerState::Armed:
+        case State::Pending:
             throw std::logic_error{"timer operation resumed before completion"};
     }
     throw std::logic_error{"invalid timer operation state"};

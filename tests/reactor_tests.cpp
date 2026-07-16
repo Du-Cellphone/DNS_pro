@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <netinet/in.h>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <sys/socket.h>
@@ -29,33 +30,96 @@ void require(bool condition, std::string_view message)
     std::exit(EXIT_FAILURE);
 }
 
+struct BlackholeUpstream
+{
+    dns::runtime::UniqueFd socket;
+    uint16_t               port{0};
+};
+
+std::optional<BlackholeUpstream> make_blackhole_upstream()
+{
+    dns::runtime::UniqueFd socket{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    if (!socket)
+        return std::nullopt;
+
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    if (::bind(socket.get(), reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0)
+        return std::nullopt;
+
+    timeval timeout{1, 0};
+    if (::setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+        return std::nullopt;
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(socket.get(), reinterpret_cast<sockaddr *>(&address), &address_length) < 0)
+        return std::nullopt;
+    return BlackholeUpstream{std::move(socket), ntohs(address.sin_port)};
+}
+
+dns::server::UpstreamConfig blackhole_config(uint16_t port)
+{
+    dns::server::UpstreamConfig config;
+    config.port           = port;
+    config.query_timeout  = std::chrono::milliseconds{10};
+    config.id_reuse_guard = std::chrono::milliseconds{20};
+    return config;
+}
+
 std::vector<std::byte> make_query(uint16_t id, dns::protocol::RecordType type)
 {
     auto name = dns::protocol::DomainName::from_text("Example.COM.");
     require(name.has_value(), "query fixture name must be valid");
 
     dns::protocol::Header header;
-    header.id = id;
+    header.id                = id;
     header.recursion_desired = true;
-    const std::array questions{dns::protocol::Question{std::move(*name), static_cast<uint16_t>(type),
-                                                       static_cast<uint16_t>(dns::protocol::RecordClass::IN)}};
+    const std::array questions{
+        dns::protocol::Question{std::move(*name), static_cast<uint16_t>(type), static_cast<uint16_t>(dns::protocol::RecordClass::IN)}};
     auto wire = dns::protocol::serialize_query(header, questions);
     require(wire.has_value(), "query fixture must serialize");
     return std::move(*wire);
 }
 
+std::vector<std::byte> make_a_response(std::span<const std::byte> query)
+{
+    require(query.size() >= dns::protocol::kDnsHeaderSize, "forwarded query must contain a DNS header");
+    std::vector<std::byte> response{query.begin(), query.end()};
+    response[2]  = std::byte{0x81}; // QR + RD
+    response[3]  = std::byte{0x80}; // RA + NOERROR
+    response[6]  = std::byte{0x00};
+    response[7]  = std::byte{0x01}; // one answer
+    response[8]  = std::byte{0x00};
+    response[9]  = std::byte{0x00};
+    response[10] = std::byte{0x00};
+    response[11] = std::byte{0x00};
+
+    constexpr std::array answer{
+        std::byte{0xc0}, std::byte{0x0c},                                   // owner = first question
+        std::byte{0x00}, std::byte{0x01},                                   // A
+        std::byte{0x00}, std::byte{0x01},                                   // IN
+        std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x3c}, // TTL 60
+        std::byte{0x00}, std::byte{0x04},                                   // RDLENGTH
+        std::byte{203},  std::byte{0},    std::byte{113},  std::byte{7},
+    };
+    response.insert(response.end(), answer.begin(), answer.end());
+    return response;
+}
+
 std::vector<std::byte> exchange(int client_fd, uint16_t port, std::span<const std::byte> request, std::string_view case_name)
 {
     sockaddr_in server{};
-    server.sin_family = AF_INET;
+    server.sin_family      = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    server.sin_port = htons(port);
+    server.sin_port        = htons(port);
 
     const ssize_t sent = ::sendto(client_fd, request.data(), request.size(), 0, reinterpret_cast<const sockaddr *>(&server), sizeof(server));
     require(sent == static_cast<ssize_t>(request.size()), "client must send the complete UDP query");
 
     std::array<std::byte, 4096> response{};
-    const ssize_t received = ::recvfrom(client_fd, response.data(), response.size(), 0, nullptr, nullptr);
+    const ssize_t               received = ::recvfrom(client_fd, response.data(), response.size(), 0, nullptr, nullptr);
     if (received <= 0)
     {
         std::cerr << "reactor exchange timed out for " << case_name << ", errno=" << errno << '\n';
@@ -67,9 +131,9 @@ std::vector<std::byte> exchange(int client_fd, uint16_t port, std::span<const st
 void send_query(int client_fd, uint16_t port, std::span<const std::byte> request)
 {
     sockaddr_in server{};
-    server.sin_family = AF_INET;
+    server.sin_family      = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    server.sin_port = htons(port);
+    server.sin_port        = htons(port);
     require(::sendto(client_fd, request.data(), request.size(), 0, reinterpret_cast<const sockaddr *>(&server), sizeof(server)) ==
                 static_cast<ssize_t>(request.size()),
             "queued datagram fixture must be sent completely");
@@ -78,7 +142,7 @@ void send_query(int client_fd, uint16_t port, std::span<const std::byte> request
 std::vector<std::byte> receive_response(int client_fd, std::string_view client_name)
 {
     std::array<std::byte, 4096> response{};
-    const ssize_t received = ::recvfrom(client_fd, response.data(), response.size(), 0, nullptr, nullptr);
+    const ssize_t               received = ::recvfrom(client_fd, response.data(), response.size(), 0, nullptr, nullptr);
     if (received <= 0)
     {
         std::cerr << "reactor receive timed out for " << client_name << ", errno=" << errno << '\n';
@@ -89,8 +153,15 @@ std::vector<std::byte> receive_response(int client_fd, std::string_view client_n
 
 void test_owned_datagrams_survive_initial_suspend()
 {
+    auto upstream = make_blackhole_upstream();
+    if (!upstream)
+    {
+        std::cout << "owned datagram socket test skipped by sandbox\n";
+        return;
+    }
+
     Cache::DNS_Cache cache{8, 1};
-    auto worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0));
+    auto             worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0), blackhole_config(upstream->port));
     if (!worker_result)
     {
         std::cout << "owned datagram socket test skipped by sandbox\n";
@@ -111,7 +182,7 @@ void test_owned_datagrams_survive_initial_suspend()
     send_query(first_client.get(), worker->bound_port(), make_query(0x1111, dns::protocol::RecordType::A));
     send_query(second_client.get(), worker->bound_port(), make_query(0x2222, dns::protocol::RecordType::AAAA));
 
-    constexpr size_t   burst_size = 80;
+    constexpr size_t   burst_size     = 80;
     constexpr uint16_t first_burst_id = 0x3000;
     for (size_t index = 0; index < burst_size; ++index)
     {
@@ -122,8 +193,8 @@ void test_owned_datagrams_survive_initial_suspend()
     // All 82 packets are now queued before the worker starts, so more than one
     // receive budget must be drained without relying on a second EPOLLET edge.
     std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
-    auto second_wire = receive_response(second_client.get(), "second client");
-    auto second = dns::protocol::parse_message(second_wire);
+    auto         second_wire = receive_response(second_client.get(), "second client");
+    auto         second      = dns::protocol::parse_message(second_wire);
     require(second && second->header.id == 0x2222, "second coroutine must retain the second packet and client address");
 
     std::array<bool, burst_size> seen{};
@@ -131,7 +202,7 @@ void test_owned_datagrams_survive_initial_suspend()
     for (size_t index = 0; index < burst_size + 1; ++index)
     {
         static_cast<void>(index);
-        auto wire = receive_response(first_client.get(), "first/burst client");
+        auto wire     = receive_response(first_client.get(), "first/burst client");
         auto response = dns::protocol::parse_message(wire);
         require(static_cast<bool>(response), "every owned datagram response must remain parseable");
         if (response->header.id == 0x1111)
@@ -151,18 +222,26 @@ void test_owned_datagrams_survive_initial_suspend()
 
     constexpr uint64_t expected_datagrams = 2 + static_cast<uint64_t>(burst_size);
     require(worker->stats().received_datagrams == expected_datagrams && worker->stats().accepted_queries == expected_datagrams &&
-                worker->stats().responses_sent == expected_datagrams,
-            "all owned datagram roots must complete before shutdown");
+                worker->stats().responses_sent == expected_datagrams && worker->stats().upstream_timeouts == expected_datagrams,
+            "all owned datagram roots must retain ownership and complete through their upstream deadlines");
 }
 
 void test_udp_reactor_responses()
 {
-    DNS service;
+    auto upstream = make_blackhole_upstream();
+    if (!upstream)
+    {
+        std::cout << "reactor socket test skipped by sandbox\n";
+        return;
+    }
+
+    DNS       service;
     DNSConfig config;
-    config.worker_count = 1;
-    config.manager_count = 0;
+    config.worker_count   = 1;
+    config.manager_count  = 0;
     config.cache_capacity = 8;
-    config.port = 0;
+    config.port           = 0;
+    config.upstream       = blackhole_config(upstream->port);
     require(service.init(config), "reactor service fixture must initialize");
 
     if (!service.start())
@@ -182,42 +261,38 @@ void test_udp_reactor_responses()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0, "client receive timeout must be configured");
 
     auto a_response_wire = exchange(client.get(), *port, make_query(0x1234, dns::protocol::RecordType::A), "A query");
-    auto a_response = dns::protocol::parse_message(a_response_wire);
-    require(a_response && a_response->header.is_response && a_response->header.id == 0x1234,
-            "reactor response must preserve QR and transaction ID");
+    auto a_response      = dns::protocol::parse_message(a_response_wire);
+    require(a_response && a_response->header.is_response && a_response->header.id == 0x1234, "reactor response must preserve QR and transaction ID");
     require(a_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::ServFail),
-            "supported MVP queries must receive fixed SERVFAIL before upstream resolution exists");
+            "an unanswered upstream query must become SERVFAIL after its deadline");
     require(a_response->questions.size() == 1 && a_response->questions.front().name.to_canonical_string() == "example.com",
-            "fixed response must echo the validated question");
+            "the timeout response must echo the validated question");
 
     auto mx_response_wire = exchange(client.get(), *port, make_query(0x2345, dns::protocol::RecordType::MX), "MX query");
-    auto mx_response = dns::protocol::parse_message(mx_response_wire);
+    auto mx_response      = dns::protocol::parse_message(mx_response_wire);
     require(mx_response && mx_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NotImp),
             "unsupported QTYPE must receive NOTIMP");
 
-    const std::array malformed{std::byte{0x34}, std::byte{0x56}, std::byte{0x01}, std::byte{0x00},
-                               std::byte{0x00}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00},
-                               std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
-    auto malformed_response_wire = exchange(client.get(), *port, malformed, "malformed query");
-    auto malformed_response = dns::protocol::parse_message(malformed_response_wire);
+    const std::array malformed{std::byte{0x34}, std::byte{0x56}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+                               std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+    auto             malformed_response_wire = exchange(client.get(), *port, malformed, "malformed query");
+    auto             malformed_response      = dns::protocol::parse_message(malformed_response_wire);
     require(malformed_response && malformed_response->header.id == 0x3456 &&
                 malformed_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::FormErr),
             "truncated query sections must receive header-only FORMERR");
 
-    const std::array response_packet{std::byte{0x56}, std::byte{0x78}, std::byte{0x80}, std::byte{0x00},
-                                     std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-                                     std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
-    sockaddr_in server{};
-    server.sin_family = AF_INET;
+    const std::array response_packet{std::byte{0x56}, std::byte{0x78}, std::byte{0x80}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                                     std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+    sockaddr_in      server{};
+    server.sin_family      = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    server.sin_port = htons(*port);
+    server.sin_port        = htons(*port);
     require(::sendto(client.get(), response_packet.data(), response_packet.size(), 0, reinterpret_cast<const sockaddr *>(&server), sizeof(server)) ==
                 static_cast<ssize_t>(response_packet.size()),
             "response-loop fixture must be sent");
     std::array<std::byte, 64> no_response{};
     errno = 0;
-    require(::recvfrom(client.get(), no_response.data(), no_response.size(), 0, nullptr, nullptr) == -1 &&
-                (errno == EAGAIN || errno == EWOULDBLOCK),
+    require(::recvfrom(client.get(), no_response.data(), no_response.size(), 0, nullptr, nullptr) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
             "the reactor must silently drop QR=1 packets instead of creating a response loop");
 
     service.request_stop();
@@ -225,14 +300,105 @@ void test_udp_reactor_responses()
     require(!service.is_running(), "eventfd must stop an epoll-blocked reactor after traffic");
 }
 
+void test_upstream_response_is_forwarded()
+{
+    auto upstream = make_blackhole_upstream();
+    if (!upstream)
+    {
+        std::cout << "upstream forwarding socket test skipped by sandbox\n";
+        return;
+    }
+
+    Cache::DNS_Cache cache{8, 1};
+    auto             upstream_config = blackhole_config(upstream->port);
+    upstream_config.query_timeout    = std::chrono::milliseconds{500};
+    upstream_config.id_reuse_guard   = std::chrono::milliseconds{500};
+    auto worker_result               = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    require(worker_result.has_value(), "forwarding worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "forwarding client fixture must be created");
+    timeval timeout{1, 0};
+    require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+            "forwarding client receive timeout must be configured");
+
+    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    send_query(client.get(), worker->bound_port(), make_query(0xbeef, dns::protocol::RecordType::A));
+
+    std::array<std::byte, 4096> forwarded_buffer{};
+    sockaddr_storage            worker_address{};
+    socklen_t                   worker_address_length = sizeof(worker_address);
+    const ssize_t               forwarded             = ::recvfrom(upstream->socket.get(), forwarded_buffer.data(), forwarded_buffer.size(), 0,
+                                                                   reinterpret_cast<sockaddr *>(&worker_address), &worker_address_length);
+    require(forwarded > 0, "the worker must send a rewritten query to its configured upstream");
+
+    const std::span<const std::byte> forwarded_query{forwarded_buffer.data(), static_cast<size_t>(forwarded)};
+    auto                             parsed_forwarded = dns::protocol::parse_message(forwarded_query);
+    require(parsed_forwarded && !parsed_forwarded->header.is_response && parsed_forwarded->questions.size() == 1,
+            "the upstream request must remain a valid one-question DNS query");
+
+    const auto upstream_response = make_a_response(forwarded_query);
+    require(::sendto(upstream->socket.get(), upstream_response.data(), upstream_response.size(), 0,
+                     reinterpret_cast<const sockaddr *>(&worker_address), worker_address_length) == static_cast<ssize_t>(upstream_response.size()),
+            "the fake upstream must return its complete DNS response");
+
+    auto client_wire = receive_response(client.get(), "forwarding client");
+    auto response    = dns::protocol::parse_message(client_wire);
+    require(response && response->header.id == 0xbeef && response->header.is_response &&
+                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError),
+            "the worker must restore the client transaction ID and forward the upstream result");
+    require(response->answers.size() == 1 &&
+                response->answers.front().rdata == std::vector<std::byte>{std::byte{203}, std::byte{0}, std::byte{113}, std::byte{7}},
+            "the forwarded response must preserve the upstream answer bytes");
+
+    worker->request_stop();
+    worker_thread.join();
+    require(worker->stats().upstream_queries == 1 && worker->stats().upstream_responses == 1 && worker->stats().upstream_timeouts == 0 &&
+                worker->stats().responses_sent == 1,
+            "the forwarding path must report one successful upstream round trip");
+}
+
+void test_shutdown_cancels_pending_upstream_query()
+{
+    auto upstream = make_blackhole_upstream();
+    if (!upstream)
+    {
+        std::cout << "pending shutdown socket test skipped by sandbox\n";
+        return;
+    }
+
+    Cache::DNS_Cache cache{8, 1};
+    auto             upstream_config = blackhole_config(upstream->port);
+    upstream_config.query_timeout    = std::chrono::seconds{5};
+    upstream_config.id_reuse_guard   = std::chrono::seconds{5};
+    auto worker_result               = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    require(worker_result.has_value(), "pending-shutdown worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "pending-shutdown client fixture must be created");
+    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    send_query(client.get(), worker->bound_port(), make_query(0xcafe, dns::protocol::RecordType::A));
+
+    std::array<std::byte, 4096> forwarded{};
+    require(::recvfrom(upstream->socket.get(), forwarded.data(), forwarded.size(), 0, nullptr, nullptr) > 0,
+            "pending-shutdown query must reach the fake upstream before stop");
+    worker->request_stop();
+    worker_thread.join();
+
+    require(worker->stats().received_datagrams == 1 && worker->stats().accepted_queries == 1 && worker->stats().upstream_queries == 1 &&
+                worker->stats().upstream_cancellations == 1 && worker->stats().responses_sent == 0 && worker->stats().internal_errors == 0,
+            "worker shutdown must cancel one pending upstream query without sending or leaking a response");
+}
+
 void test_truncated_datagram_decision()
 {
     const std::array prefix{std::byte{0x45}, std::byte{0x67}, std::byte{0x01}, std::byte{0x00}};
-    auto decision = dns::server::WorkerLoop::evaluate_datagram(prefix, true);
+    auto             decision = dns::server::WorkerLoop::evaluate_datagram(prefix, true);
     require(decision.outcome == dns::server::DatagramOutcome::Truncated, "MSG_TRUNC must bypass normal packet parsing");
     auto response = dns::protocol::parse_message(decision.response);
-    require(response && response->header.id == 0x4567 &&
-                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::FormErr),
+    require(response && response->header.id == 0x4567 && response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::FormErr),
             "a truncated query with an ID must produce header-only FORMERR");
 }
 
@@ -243,6 +409,8 @@ int main()
     test_truncated_datagram_decision();
     test_owned_datagrams_survive_initial_suspend();
     test_udp_reactor_responses();
+    test_upstream_response_is_forwarded();
+    test_shutdown_cancels_pending_upstream_query();
     std::cout << "all reactor tests passed\n";
     return EXIT_SUCCESS;
 }
