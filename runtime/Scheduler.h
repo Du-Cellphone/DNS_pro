@@ -133,6 +133,7 @@ public:
     [[nodiscard]] bool   has_ready() const noexcept { return ready_head_ != nullptr; }
     [[nodiscard]] size_t ready_count() const noexcept { return ready_count_; }
     [[nodiscard]] size_t active_count() const noexcept { return active_count_; }
+    [[nodiscard]] bool   owns_current_thread() const noexcept { return on_owner_thread(); }
     [[nodiscard]] bool accepting() const noexcept
     {
         return accepting_ && !external_stop_pending_.load(std::memory_order_acquire) && !stop_token_.stop_requested();

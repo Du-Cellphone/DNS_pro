@@ -4,6 +4,7 @@
 #include "common/Expected.h"
 #include "runtime/Scheduler.h"
 #include "runtime/Task.h"
+#include "runtime/TimerQueue.h"
 #include "runtime/UniqueFd.h"
 
 #include <cstddef>
@@ -98,6 +99,7 @@ private:
 
     static constexpr size_t kMaximumDatagramSize = 4096;
     static constexpr size_t kReceiveBudget = 64;
+    static constexpr size_t kTimerBudget = 64;
     static constexpr size_t kReadyBudget = 64;
     static constexpr size_t kShutdownResumeBudget = 4096;
 
@@ -119,6 +121,9 @@ private:
     runtime::UniqueFd      listen_fd_;
     runtime::UniqueFd      epoll_fd_;
     runtime::UniqueFd      wake_fd_;
+    // TimerQueue borrows nodes from coroutine frames, so it is declared before
+    // Scheduler and therefore destroyed after Scheduler.
+    runtime::TimerQueue    timer_queue_;
     runtime::Scheduler     scheduler_;
     WorkerStats            stats_;
     mutable std::stop_source stop_source_;

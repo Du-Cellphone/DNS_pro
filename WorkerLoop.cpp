@@ -135,6 +135,13 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
             std::cerr << "worker " << worker_id_ << " scheduler could not start\n";
             return;
         }
+        if (!timer_queue_.start(scheduler_))
+        {
+            ++stats_.internal_errors;
+            std::cerr << "worker " << worker_id_ << " timer queue could not start\n";
+            static_cast<void>(scheduler_.shutdown());
+            return;
+        }
     }
     catch (const std::exception &error)
     {
@@ -145,7 +152,8 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
 
     while (!stop_token.stop_requested())
     {
-        const int timeout = (listener_pending_ || scheduler_.has_ready()) ? 0 : -1;
+        const int timeout =
+            (listener_pending_ || scheduler_.has_ready()) ? 0 : timer_queue_.wait_timeout(runtime::TimerQueue::Clock::now());
         const int ready = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), timeout);
         if (ready < 0)
         {
@@ -172,13 +180,21 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
         if (listener_pending_)
             drain_listener(stop_token);
 
+        static_cast<void>(timer_queue_.expire(runtime::TimerQueue::Clock::now(), kTimerBudget));
         static_cast<void>(scheduler_.run_ready(kReadyBudget));
     }
 
+    // close() rejects new roots but deliberately leaves schedule() available,
+    // allowing cancelled timer waiters to enter the ready queue and unwind.
     static_cast<void>(scheduler_.close());
+    static_cast<void>(timer_queue_.close());
+    static_cast<void>(timer_queue_.cancel_all());
     static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
+    if (!timer_queue_.stop())
+        ++stats_.internal_errors;
     stats_.internal_errors +=
-        static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures());
+        static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures() +
+                              timer_queue_.invariant_failures());
 }
 
 void WorkerLoop::request_stop() const noexcept
@@ -292,6 +308,9 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
 
         if (!decision.response.empty() && !stop_token.stop_requested())
             send_response(decision.response, reinterpret_cast<const sockaddr *>(&datagram.client_address), datagram.client_length);
+    }
+    catch (const runtime::OperationCancelled &)
+    {
     }
     catch (const std::exception &error)
     {
