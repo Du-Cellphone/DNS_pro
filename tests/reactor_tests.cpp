@@ -69,11 +69,8 @@ dns::server::UpstreamConfig blackhole_config(uint16_t port)
     return config;
 }
 
-std::vector<std::byte> make_query(uint16_t                  id,
-                                  dns::protocol::RecordType type,
-                                  std::string_view          domain = "Example.COM.",
-                                  bool                      checking_disabled = false,
-                                  bool                      authenticated_data = false)
+std::vector<std::byte> make_query(uint16_t id, dns::protocol::RecordType type, std::string_view domain = "Example.COM.",
+                                  bool checking_disabled = false, bool authenticated_data = false)
 {
     auto name = dns::protocol::DomainName::from_text(domain);
     require(name.has_value(), "query fixture name must be valid");
@@ -93,8 +90,7 @@ std::vector<std::byte> make_query(uint16_t                  id,
 std::vector<std::byte> make_a_rrset_response(std::span<const std::byte> query)
 {
     auto request = dns::protocol::parse_message(query);
-    require(request && request->questions.size() == 1 &&
-                request->questions.front().type == static_cast<uint16_t>(dns::protocol::RecordType::A),
+    require(request && request->questions.size() == 1 && request->questions.front().type == static_cast<uint16_t>(dns::protocol::RecordType::A),
             "forwarded A query fixture must parse");
 
     const std::array first{std::byte{192}, std::byte{0}, std::byte{2}, std::byte{10}};
@@ -108,8 +104,7 @@ std::vector<std::byte> make_a_rrset_response(std::span<const std::byte> query)
 std::vector<std::byte> make_aaaa_rrset_response(std::span<const std::byte> query)
 {
     auto request = dns::protocol::parse_message(query);
-    require(request && request->questions.size() == 1 &&
-                request->questions.front().type == static_cast<uint16_t>(dns::protocol::RecordType::AAAA),
+    require(request && request->questions.size() == 1 && request->questions.front().type == static_cast<uint16_t>(dns::protocol::RecordType::AAAA),
             "forwarded AAAA query fixture must parse");
 
     std::array<std::byte, 16> first{};
@@ -202,8 +197,8 @@ ForwardedQuery receive_forwarded_query(BlackholeUpstream &upstream, std::string_
     std::array<std::byte, 4096> buffer{};
     ForwardedQuery              query;
     query.worker_address_length = sizeof(query.worker_address);
-    const ssize_t received = ::recvfrom(upstream.socket.get(), buffer.data(), buffer.size(), 0,
-                                        reinterpret_cast<sockaddr *>(&query.worker_address), &query.worker_address_length);
+    const ssize_t received = ::recvfrom(upstream.socket.get(), buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr *>(&query.worker_address),
+                                        &query.worker_address_length);
     if (received <= 0)
     {
         std::cerr << "upstream receive timed out for " << case_name << ", errno=" << errno << '\n';
@@ -215,9 +210,8 @@ ForwardedQuery receive_forwarded_query(BlackholeUpstream &upstream, std::string_
 
 void send_upstream_response(BlackholeUpstream &upstream, const ForwardedQuery &query, std::span<const std::byte> response)
 {
-    require(::sendto(upstream.socket.get(), response.data(), response.size(), 0,
-                     reinterpret_cast<const sockaddr *>(&query.worker_address), query.worker_address_length) ==
-                static_cast<ssize_t>(response.size()),
+    require(::sendto(upstream.socket.get(), response.data(), response.size(), 0, reinterpret_cast<const sockaddr *>(&query.worker_address),
+                     query.worker_address_length) == static_cast<ssize_t>(response.size()),
             "the fake upstream must send its complete response");
 }
 
@@ -324,6 +318,10 @@ void test_udp_reactor_responses()
 
     const auto port = service.bound_port();
     require(port && *port != 0, "port-zero binding must publish the assigned local port");
+
+    auto disabled_update = service.replace_blocked_domains({"disabled.example"});
+    require(!disabled_update && disabled_update.error().code == dns::server::FilterUpdateErrorCode::ControlPlaneDisabled,
+            "a running service without a manager must reject runtime reload without blocking");
 
     dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
     require(static_cast<bool>(client), "UDP client fixture must be created");
@@ -460,8 +458,7 @@ void test_positive_rrsets_are_cached_without_upstream_requery()
     send_upstream_response(*upstream, first_a_forwarded, first_a_response);
     auto first_a_wire = receive_response(client.get(), "first A cache miss");
     auto first_a      = dns::protocol::parse_message(first_a_wire);
-    require(first_a && first_a->header.id == 0x1001 && first_a->answers.size() == 2,
-            "the first A request must receive the complete upstream RRset");
+    require(first_a && first_a->header.id == 0x1001 && first_a->answers.size() == 2, "the first A request must receive the complete upstream RRset");
 
     send_query(client.get(), worker->bound_port(), make_query(0x1002, dns::protocol::RecordType::A, "cAcHe.eXaMpLe"));
     auto cached_a_wire = receive_response(client.get(), "cached A response");
@@ -503,9 +500,8 @@ void test_positive_rrsets_are_cached_without_upstream_requery()
     send_query(client.get(), worker->bound_port(), make_query(0x2002, dns::protocol::RecordType::AAAA, "CACHE.EXAMPLE."));
     auto cached_aaaa_wire = receive_response(client.get(), "cached AAAA response");
     auto cached_aaaa      = dns::protocol::parse_message(cached_aaaa_wire);
-    require(cached_aaaa && cached_aaaa->header.id == 0x2002 && cached_aaaa->answers.size() == 2 &&
-                cached_aaaa->answers.front().rdata.size() == 16 && cached_aaaa->answers.front().ttl > 0 &&
-                cached_aaaa->answers.front().ttl <= 45,
+    require(cached_aaaa && cached_aaaa->header.id == 0x2002 && cached_aaaa->answers.size() == 2 && cached_aaaa->answers.front().rdata.size() == 16 &&
+                cached_aaaa->answers.front().ttl > 0 && cached_aaaa->answers.front().ttl <= 45,
             "a AAAA cache hit must retain its own address width and TTL");
 
     worker->request_stop();
@@ -525,23 +521,26 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
         return;
     }
 
-    const std::vector<std::string> no_rules;
-    auto                           initial_snapshot = dns::server::build_filter_snapshot(no_rules);
-    require(initial_snapshot.has_value(), "empty filter snapshot fixture must build");
-    dns::server::FilterSnapshotSlot snapshots;
-    snapshots.store(std::move(*initial_snapshot), std::memory_order_release);
+    DNS       service;
+    DNSConfig config;
+    config.worker_count   = 1;
+    config.manager_count  = 1;
+    config.cache_capacity = 8;
+    config.port           = 0;
+    config.upstream       = blackhole_config(upstream->port);
+    require(service.init(config), "runtime-filter service fixture must initialize");
+    if (!service.start())
+    {
+        std::cout << "filter pipeline socket test skipped by sandbox\n";
+        return;
+    }
 
-    Cache::DNS_Cache cache{8, 1};
-    auto             cached_name = dns::protocol::DomainName::from_text("www.blocked.example");
-    require(cached_name.has_value(), "cached blocked-name fixture must parse");
-    Cache::CacheKey cache_key{*cached_name, static_cast<uint16_t>(dns::protocol::RecordType::A),
-                              static_cast<uint16_t>(dns::protocol::RecordClass::IN)};
-    cache.shard(0).put(cache_key, Cache::IPAddress::v4({203, 0, 113, 9}), 60, Cache::Clock::now());
+    auto ready_update = service.replace_blocked_domains({});
+    require(ready_update && ready_update->generation == 2 && ready_update->rule_count == 0,
+            "start must return with the manager ready to process an immediate replacement");
 
-    auto upstream_config = blackhole_config(upstream->port);
-    auto worker_result    = dns::server::WorkerLoop::create(0, 0, cache.shard(0), snapshots, upstream_config);
-    require(worker_result.has_value(), "filter-pipeline worker fixture must initialize");
-    auto worker = std::move(*worker_result);
+    const auto port = service.bound_port();
+    require(port.has_value(), "runtime-filter service must publish its bound port");
 
     dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
     require(static_cast<bool>(client), "filter-pipeline client fixture must be created");
@@ -549,33 +548,63 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "filter-pipeline client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
-    send_query(client.get(), worker->bound_port(), make_query(0x3001, dns::protocol::RecordType::A, "WWW.Blocked.Example."));
-    auto allowed_wire = receive_response(client.get(), "cache hit before filter update");
-    auto allowed      = dns::protocol::parse_message(allowed_wire);
-    require(allowed && allowed->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) &&
-                allowed->answers.size() == 1,
-            "the empty initial snapshot must allow an existing positive cache entry");
+    send_query(client.get(), *port, make_query(0x3001, dns::protocol::RecordType::A, "WWW.Blocked.Example."));
+    auto forwarded         = receive_forwarded_query(*upstream, "cache warm before runtime filter update");
+    auto upstream_response = make_a_rrset_response(forwarded.packet);
+    send_upstream_response(*upstream, forwarded, upstream_response);
+    auto warm_wire = receive_response(client.get(), "cache warm before runtime filter update");
+    auto warm      = dns::protocol::parse_message(warm_wire);
+    require(warm && warm->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && warm->answers.size() == 2,
+            "the initial empty snapshot must allow an upstream response to warm the positive cache");
 
-    const std::vector<std::string> rules{"blocked.example"};
-    auto                           blocked_snapshot = dns::server::build_filter_snapshot(rules);
-    require(blocked_snapshot.has_value(), "parent-domain filter snapshot fixture must build");
-    snapshots.store(std::move(*blocked_snapshot), std::memory_order_release);
+    send_query(client.get(), *port, make_query(0x3002, dns::protocol::RecordType::A, "www.blocked.example"));
+    auto cached_wire = receive_response(client.get(), "cache hit before runtime filter update");
+    auto cached      = dns::protocol::parse_message(cached_wire);
+    require(cached && cached->header.id == 0x3002 && cached->answers.size() == 2,
+            "the warmed response must be served from cache before the rule is installed");
 
-    send_query(client.get(), worker->bound_port(), make_query(0x3002, dns::protocol::RecordType::A, "www.blocked.example"));
+    auto update = service.replace_blocked_domains({"blocked.example"});
+    require(update && update->generation == 3 && update->rule_count == 1, "the manager must publish a complete third-generation blocklist");
+    require(service.filter_version() == std::optional{*update}, "the public filter version must identify the committed snapshot");
+
+    send_query(client.get(), *port, make_query(0x3003, dns::protocol::RecordType::A, "www.blocked.example"));
     auto refused_wire = receive_response(client.get(), "REFUSED after filter update");
     auto refused      = dns::protocol::parse_message(refused_wire);
-    require(refused && refused->header.id == 0x3002 &&
-                refused->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::Refused) &&
+    require(refused && refused->header.id == 0x3003 && refused->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::Refused) &&
                 refused->questions.size() == 1 && refused->questions.front().name.to_string() == "www.blocked.example" && refused->answers.empty(),
             "a parent-domain rule must return REFUSED with the current ID/question even when a positive cache entry exists");
 
-    worker->request_stop();
-    worker_thread.join();
-    require(worker->stats().accepted_queries == 2 && worker->stats().cache_hits == 1 && worker->stats().cache_misses == 0 &&
-                worker->stats().blocked_queries == 1 && worker->stats().upstream_queries == 0 && worker->stats().responses_sent == 2 &&
-                worker->stats().internal_errors == 0,
-            "a newly published filter snapshot must run before cache lookup and avoid every upstream query");
+    auto invalid = service.replace_blocked_domains({"*.bad.example"});
+    require(!invalid && invalid.error().code == dns::server::FilterUpdateErrorCode::BuildFailed,
+            "an invalid runtime replacement must report a build failure");
+    require(service.filter_version() == std::optional{dns::server::FilterVersion{3, 1}},
+            "an invalid runtime replacement must retain the committed generation");
+
+    send_query(client.get(), *port, make_query(0x3004, dns::protocol::RecordType::A, "www.blocked.example"));
+    auto rollback_wire = receive_response(client.get(), "REFUSED after invalid filter replacement");
+    auto rollback      = dns::protocol::parse_message(rollback_wire);
+    require(rollback && rollback->header.id == 0x3004 &&
+                rollback->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::Refused) && rollback->answers.empty(),
+            "a failed replacement must leave the previous filtering behavior intact");
+
+    auto cleared = service.replace_blocked_domains({});
+    require(cleared && cleared->generation == 4 && cleared->rule_count == 0, "an empty replacement must atomically remove all runtime rules");
+
+    send_query(client.get(), *port, make_query(0x3005, dns::protocol::RecordType::A, "www.blocked.example"));
+    auto restored_wire = receive_response(client.get(), "cache hit after clearing runtime filter");
+    auto restored      = dns::protocol::parse_message(restored_wire);
+    require(restored && restored->header.id == 0x3005 &&
+                restored->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && restored->answers.size() == 2,
+            "clearing the filter must expose the existing positive cache entry without another upstream query");
+
+    std::array<std::byte, 64> unexpected_upstream{};
+    errno = 0;
+    require(::recvfrom(upstream->socket.get(), unexpected_upstream.data(), unexpected_upstream.size(), MSG_DONTWAIT, nullptr, nullptr) == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK),
+            "cache hits, refused responses, rollback, and rule removal must not emit another upstream packet");
+
+    service.request_stop();
+    service.join();
 }
 
 void test_configured_filter_snapshot_reaches_dns_workers()
@@ -589,10 +618,10 @@ void test_configured_filter_snapshot_reaches_dns_workers()
 
     DNS       service;
     DNSConfig config;
-    config.worker_count   = 1;
-    config.manager_count  = 0;
-    config.cache_capacity = 8;
-    config.port           = 0;
+    config.worker_count    = 1;
+    config.manager_count   = 0;
+    config.cache_capacity  = 8;
+    config.port            = 0;
     config.blocked_domains = {"blocked.example"};
     config.upstream        = blackhole_config(upstream->port);
     require(service.init(config), "configured filter service fixture must initialize");
@@ -610,9 +639,9 @@ void test_configured_filter_snapshot_reaches_dns_workers()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "configured filter client receive timeout must be configured");
 
-    auto response_wire = exchange(client.get(), *port, make_query(0x4001, dns::protocol::RecordType::A, "child.Blocked.Example."),
-                                  "configured parent-domain filter");
-    auto response      = dns::protocol::parse_message(response_wire);
+    auto response_wire =
+        exchange(client.get(), *port, make_query(0x4001, dns::protocol::RecordType::A, "child.Blocked.Example."), "configured parent-domain filter");
+    auto response = dns::protocol::parse_message(response_wire);
     require(response && response->header.id == 0x4001 &&
                 response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::Refused) &&
                 response->questions.front().name.to_string() == "child.Blocked.Example",

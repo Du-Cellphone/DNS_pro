@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,13 +22,13 @@ void require(bool condition, std::string_view message)
 
 void test_cuckoo_failed_kick_is_atomic()
 {
-    Filter::CuckooFilter filter{8, 1};
+    Filter::CuckooFilter     filter{8, 1};
     std::vector<std::string> inserted;
-    bool observed_kick_failure = false;
+    bool                     observed_kick_failure = false;
 
     for (size_t index = 0; index < 10'000; ++index)
     {
-        std::string key = "rule-" + std::to_string(index) + ".example";
+        std::string  key         = "rule-" + std::to_string(index) + ".example";
         const size_t size_before = filter.get_size();
         if (filter.insert(key))
         {
@@ -66,7 +67,7 @@ void test_radix_tree_is_canonical_and_const_safe()
 void test_domain_blocklist_pipeline_semantics()
 {
     const std::vector<std::string> rules{"Example.COM.", "www.specific.test", "example.com"};
-    auto blocklist = Filter::DomainBlocklist::build(rules);
+    auto                           blocklist = Filter::DomainBlocklist::build(rules);
     require(blocklist.has_value(), "valid rules must build a blocklist snapshot");
     require(blocklist->rule_count() == 2, "canonical duplicate rules must be removed");
 
@@ -78,19 +79,25 @@ void test_domain_blocklist_pipeline_semantics()
     require(!blocklist->matches("example.net"), "an unrelated query must not match");
 
     const std::vector<std::string> wildcard{"*.example.com"};
-    auto wildcard_result = Filter::DomainBlocklist::build(wildcard);
+    auto                           wildcard_result = Filter::DomainBlocklist::build(wildcard);
     require(!wildcard_result && wildcard_result.error().code == Filter::BlocklistBuildErrorCode::WildcardNotSupported,
             "MVP wildcard rules must be rejected explicitly");
 
     const std::vector<std::string> invalid{"example..com"};
-    auto invalid_result = Filter::DomainBlocklist::build(invalid);
+    auto                           invalid_result = Filter::DomainBlocklist::build(invalid);
     require(!invalid_result && invalid_result.error().code == Filter::BlocklistBuildErrorCode::InvalidDomain,
             "invalid rule names must reject the whole snapshot");
 
     const std::vector<std::string> root{"."};
-    auto root_result = Filter::DomainBlocklist::build(root);
+    auto                           root_result = Filter::DomainBlocklist::build(root);
     require(!root_result && root_result.error().code == Filter::BlocklistBuildErrorCode::RootRuleNotAllowed,
             "a root rule must not accidentally block all DNS traffic");
+
+    std::stop_source cancelled;
+    cancelled.request_stop();
+    auto cancelled_result = Filter::DomainBlocklist::build(rules, cancelled.get_token());
+    require(!cancelled_result && cancelled_result.error().code == Filter::BlocklistBuildErrorCode::Cancelled,
+            "a cancelled control-plane build must stop before publishing a partial snapshot");
 }
 
 } // namespace

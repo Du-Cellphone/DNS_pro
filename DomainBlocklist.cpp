@@ -39,8 +39,11 @@ DomainBlocklist::DomainBlocklist(size_t bucket_count)
 {
 }
 
-dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules)
+dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules, std::stop_token stop_token)
 {
+    if (stop_token.stop_requested())
+        return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
+
     std::vector<dns::protocol::DomainName> canonical_rules;
     canonical_rules.reserve(rules.size());
     std::unordered_set<std::string, XXH3_64> unique_rules;
@@ -48,6 +51,9 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
 
     for (size_t index = 0; index < rules.size(); ++index)
     {
+        if (stop_token.stop_requested())
+            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+
         auto name = dns::protocol::DomainName::from_text(rules[index]);
         if (!name)
             return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::InvalidDomain, index});
@@ -64,10 +70,16 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
     size_t bucket_count = initial_bucket_count(canonical_rules.size());
     while (true)
     {
+        if (stop_token.stop_requested())
+            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
+
         DomainBlocklist candidate{bucket_count};
         bool            inserted_all = true;
-        for (const auto &name : canonical_rules)
+        for (size_t index = 0; index < canonical_rules.size(); ++index)
         {
+            if (stop_token.stop_requested())
+                return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+            const auto &name = canonical_rules[index];
             if (!candidate.prefilter_.insert(name.canonical_key()))
             {
                 inserted_all = false;
@@ -77,8 +89,12 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
 
         if (inserted_all)
         {
-            for (const auto &name : canonical_rules)
-                candidate.tree_.insert(name);
+            for (size_t index = 0; index < canonical_rules.size(); ++index)
+            {
+                if (stop_token.stop_requested())
+                    return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+                candidate.tree_.insert(canonical_rules[index]);
+            }
             candidate.rule_count_ = canonical_rules.size();
             return candidate;
         }

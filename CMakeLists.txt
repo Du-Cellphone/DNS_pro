@@ -40,6 +40,7 @@ add_library(dns_core STATIC
     CuckooFilter.cpp
     DomainBlocklist.cpp
     FilterContext.cpp
+    FilterUpdateController.cpp
     protocol/DnsParser.cpp
     protocol/DnsQuery.cpp
     protocol/DnsResponse.cpp
@@ -91,6 +92,13 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_filter_tests)
     add_test(NAME dns_filter_tests COMMAND dns_filter_tests)
     set_tests_properties(dns_filter_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_filter_reload_tests tests/filter_reload_tests.cpp)
+    target_link_libraries(dns_filter_reload_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_filter_reload_tests)
+    dns_pro_enable_sanitizers(dns_filter_reload_tests)
+    add_test(NAME dns_filter_reload_tests COMMAND dns_filter_reload_tests)
+    set_tests_properties(dns_filter_reload_tests PROPERTIES TIMEOUT 10)
 
     add_executable(dns_cache_tests tests/cache_tests.cpp)
     target_link_libraries(dns_cache_tests PRIVATE dns_core)

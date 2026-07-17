@@ -2,11 +2,14 @@
 #include "runtime/UniqueFd.h"
 
 #include <cerrno>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
+#include <optional>
 #include <string_view>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -53,31 +56,42 @@ void test_unique_fd_ownership()
 
 void test_service_configuration_and_stop()
 {
+    DNS  not_initialized;
+    auto not_running = not_initialized.replace_blocked_domains({"example.com"});
+    require(!not_running && not_running.error().code == dns::server::FilterUpdateErrorCode::ServiceNotRunning,
+            "reload before initialization must fail without queuing work");
+
     DNS       invalid_rules_service;
     DNSConfig invalid_rules;
     invalid_rules.blocked_domains = {"*.example"};
     require(!invalid_rules_service.init(invalid_rules), "unsupported wildcard rules must fail before a filter snapshot is published");
 
-    DNS service;
+    DNS       service;
     DNSConfig invalid;
     invalid.worker_count = 0;
     require(!service.init(invalid), "zero workers must be rejected before allocating resources");
 
-    invalid.worker_count = 1;
+    invalid.worker_count  = 1;
     invalid.manager_count = 2;
     require(!service.init(invalid), "more than one control-plane manager must be rejected in the MVP");
 
-    invalid.manager_count = 1;
-    invalid.upstream.query_timeout = std::chrono::seconds{2};
+    invalid.manager_count           = 1;
+    invalid.upstream.query_timeout  = std::chrono::seconds{2};
     invalid.upstream.id_reuse_guard = std::chrono::seconds{1};
     require(!service.init(invalid), "the transaction-ID reuse guard must cover at least one upstream timeout window");
 
     DNSConfig config;
-    config.worker_count = 1;
-    config.manager_count = 1;
+    config.worker_count   = 1;
+    config.manager_count  = 1;
     config.cache_capacity = 8;
-    config.port = 0;
+    config.port           = 0;
     require(service.init(config), "a small valid service configuration must initialize");
+    require(service.filter_version() == std::optional{dns::server::FilterVersion{1, 0}},
+            "initialization must publish the compiled generation-one snapshot");
+
+    auto initialized_reload = service.replace_blocked_domains({"example.com"});
+    require(!initialized_reload && initialized_reload.error().code == dns::server::FilterUpdateErrorCode::ServiceNotRunning,
+            "reload requires a running manager rather than building on the caller thread");
 
     // Some restricted test sandboxes deny socket(2). In a normal Linux
     // environment this branch exercises an epoll-blocked worker and verifies
@@ -87,9 +101,45 @@ void test_service_configuration_and_stop()
     {
         require(service.is_running(), "successful start must publish the running state");
         require(!service.start(), "starting an already running service must fail");
-        service.request_stop();
-        service.join();
+
+        std::barrier                                   shutdown_gate{3};
+        std::optional<dns::server::FilterUpdateResult> raced_reload;
+        std::jthread                                   reloader{[&]
+                              {
+                                  shutdown_gate.arrive_and_wait();
+                                  raced_reload.emplace(service.replace_blocked_domains({"race.example"}));
+                              }};
+        std::jthread                                   stopper{[&]
+                             {
+                                 shutdown_gate.arrive_and_wait();
+                                 service.request_stop();
+                             }};
+        shutdown_gate.arrive_and_wait();
+        reloader.join();
+        stopper.join();
+        require(raced_reload.has_value(), "a reload racing shutdown must always complete");
+        require(*raced_reload || raced_reload->error().code == dns::server::FilterUpdateErrorCode::ShuttingDown,
+                "a reload racing shutdown must either commit first or report shutdown");
+
+        std::barrier join_gate{3};
+        std::jthread first_joiner{[&]
+                                  {
+                                      join_gate.arrive_and_wait();
+                                      service.join();
+                                  }};
+        std::jthread second_joiner{[&]
+                                   {
+                                       join_gate.arrive_and_wait();
+                                       service.join();
+                                   }};
+        join_gate.arrive_and_wait();
+        first_joiner.join();
+        second_joiner.join();
         require(!service.is_running(), "join must finish all workers and clear the running state");
+
+        auto stopped_reload = service.replace_blocked_domains({"example.com"});
+        require(!stopped_reload && stopped_reload.error().code == dns::server::FilterUpdateErrorCode::ShuttingDown,
+                "reload after shutdown must complete immediately with a shutdown error");
     }
     else
     {
