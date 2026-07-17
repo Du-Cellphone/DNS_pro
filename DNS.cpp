@@ -21,12 +21,18 @@ bool DNS::init(const DNSConfig &config)
 
     try
     {
-        auto cache = std::make_unique<Cache::DNS_Cache>(config.cache_capacity, config.worker_count);
-        auto context = std::make_shared<const FilterContext>();
+        DNSConfig configured = config;
+        auto      context    = dns::server::build_filter_snapshot(configured.blocked_domains);
+        if (!context)
+        {
+            std::cerr << "failed to initialize blocklist at rule " << context.error().rule_index << '\n';
+            return false;
+        }
+        auto cache = std::make_unique<Cache::DNS_Cache>(configured.cache_capacity, configured.worker_count);
 
+        config_ = std::move(configured);
         cache_ = std::move(cache);
-        active_context_.store(std::move(context), std::memory_order_release);
-        config_ = config;
+        active_context_.store(std::move(*context), std::memory_order_release);
         state_ = State::Initialized;
         return true;
     }
@@ -57,7 +63,8 @@ bool DNS::start()
     {
         for (size_t worker_id = 0; worker_id < config_.worker_count; ++worker_id)
         {
-            auto loop = dns::server::WorkerLoop::create(worker_id, config_.port, cache_->shard(worker_id), config_.upstream);
+            auto loop =
+                dns::server::WorkerLoop::create(worker_id, config_.port, cache_->shard(worker_id), active_context_, config_.upstream);
             if (!loop)
             {
                 std::cerr << "failed to initialize worker " << worker_id << " at step " << static_cast<int>(loop.error().step)

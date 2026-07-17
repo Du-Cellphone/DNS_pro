@@ -46,6 +46,9 @@ canonical QNAME + QTYPE + QCLASS
 ```
 
 - 第一版只缓存成功的 `A` 和 `AAAA` 正响应。
+- 地址缓存以完整的直接 `A`/`AAAA` RRset 为值，并以 RRset 中最小 TTL 作为统一缓存期限；不会只截取多地址响应中的第一条记录。
+- 第一版不会把 `CNAME` 链改写为直接地址答案。包含别名链或无法由地址 RRset 无损重建的 authority/additional 数据时，响应仍透明转发，但不进入缓存。
+- 带 `CD` 或 `AD` DNSSEC 控制位的查询透明转发但绕过地址缓存，避免与普通查询共享未经验证或验证语义不同的结果。
 - 缓存采用上游响应中的实际 TTL，并使用单调时钟判断过期。
 - 返回缓存响应时必须恢复当前客户端的 transaction ID，并反映剩余 TTL。
 - 第一版不实现 `NXDOMAIN`、NODATA 等负缓存。

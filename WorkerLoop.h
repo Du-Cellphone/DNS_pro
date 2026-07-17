@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DNS_Cache.h"
+#include "FilterContext.h"
 #include "common/Expected.h"
 #include "protocol/DnsMessage.h"
 #include "runtime/Scheduler.h"
@@ -64,6 +65,11 @@ struct WorkerStats
     uint64_t parse_errors{0};
     uint64_t unsupported_queries{0};
     uint64_t accepted_queries{0};
+    uint64_t blocked_queries{0};
+    uint64_t cache_hits{0};
+    uint64_t cache_misses{0};
+    uint64_t cache_bypasses{0};
+    uint64_t cache_inserts{0};
     uint64_t responses_sent{0};
     uint64_t send_errors{0};
     uint64_t upstream_queries{0};
@@ -100,7 +106,12 @@ class WorkerLoop final
 public:
     using CreateResult = Expected<std::unique_ptr<WorkerLoop>, WorkerInitError>;
 
-    static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
+    static CreateResult create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
+    static CreateResult create(size_t                  worker_id,
+                               uint16_t                port,
+                               Cache::CacheShard      &cache_shard,
+                               const FilterSnapshotSlot &filter_snapshots,
+                               const UpstreamConfig   &upstream_config = {});
     static DatagramDecision evaluate_datagram(std::span<const std::byte> packet, bool truncated);
 
     WorkerLoop(const WorkerLoop &)            = delete;
@@ -136,9 +147,10 @@ private:
     static constexpr size_t kReadyBudget           = 64;
     static constexpr size_t kShutdownResumeBudget  = 4096;
 
-    WorkerLoop(size_t worker_id, Cache::CacheShard &cache_shard)
+    WorkerLoop(size_t worker_id, Cache::CacheShard &cache_shard, const FilterSnapshotSlot *filter_snapshots)
         : worker_id_(worker_id)
         , cache_shard_(cache_shard)
+        , filter_snapshots_(filter_snapshots)
     {
     }
 
@@ -151,6 +163,7 @@ private:
     size_t                         worker_id_{0};
     uint16_t                       bound_port_{0};
     Cache::CacheShard             &cache_shard_;
+    const FilterSnapshotSlot      *filter_snapshots_{nullptr};
     runtime::UniqueFd              listen_fd_;
     runtime::UniqueFd              epoll_fd_;
     runtime::UniqueFd              wake_fd_;

@@ -13,11 +13,16 @@ enum class WriteErrorCode
 {
     MessageTooLarge,
     TooManyQuestions,
+    TooManyAnswers,
     InvalidOpcode,
     InvalidResponseCode,
     InvalidMaximumSize,
     ExpectedQuery,
     MissingTransactionId,
+    WrongQuestionCount,
+    UnsupportedAddressType,
+    InvalidAddressLength,
+    MissingAnswers,
 };
 
 struct WriteError
@@ -41,5 +46,16 @@ WriteResult make_error_response(const Message &request,
 WriteResult make_format_error_response(std::span<const std::byte> malformed_request,
                                        bool                       recursion_available = true,
                                        size_t                     maximum_size = 65'535);
+
+struct AddressAnswerView
+{
+    std::span<const std::byte> bytes;
+};
+
+WriteResult make_address_response(const Message                         &request,
+                                  std::span<const AddressAnswerView>     answers,
+                                  uint32_t                               ttl,
+                                  bool                                   recursion_available = true,
+                                  size_t                                 maximum_size = 65'535);
 
 } // namespace dns::protocol

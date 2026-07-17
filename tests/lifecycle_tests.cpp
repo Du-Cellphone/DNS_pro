@@ -53,6 +53,11 @@ void test_unique_fd_ownership()
 
 void test_service_configuration_and_stop()
 {
+    DNS       invalid_rules_service;
+    DNSConfig invalid_rules;
+    invalid_rules.blocked_domains = {"*.example"};
+    require(!invalid_rules_service.init(invalid_rules), "unsupported wildcard rules must fail before a filter snapshot is published");
+
     DNS service;
     DNSConfig invalid;
     invalid.worker_count = 0;

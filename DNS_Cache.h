@@ -60,20 +60,21 @@ struct CacheKeyHash
 
 struct CacheHit
 {
-    IPAddress address;
-    uint32_t  remaining_ttl{0};
+    std::vector<IPAddress> addresses;
+    uint32_t               remaining_ttl{0};
 };
 
 class CacheShard final
 {
 public:
     explicit CacheShard(size_t capacity);
-    CacheShard(CacheShard &&) noexcept = default;
+    CacheShard(CacheShard &&) noexcept            = default;
     CacheShard &operator=(CacheShard &&) noexcept = default;
-    CacheShard(const CacheShard &) = delete;
-    CacheShard &operator=(const CacheShard &) = delete;
+    CacheShard(const CacheShard &)                = delete;
+    CacheShard &operator=(const CacheShard &)     = delete;
 
     [[nodiscard]] std::optional<CacheHit> get(const CacheKey &key, TimePoint now);
+    void put(CacheKey key, std::vector<IPAddress> addresses, uint32_t ttl_seconds, TimePoint now);
     void put(CacheKey key, IPAddress address, uint32_t ttl_seconds, TimePoint now);
 
     [[nodiscard]] size_t size() const noexcept { return index_.size(); }
@@ -82,15 +83,15 @@ public:
 private:
     struct CacheEntry
     {
-        CacheKey key;
-        IPAddress address;
-        TimePoint expiry;
-        bool      chance{true};
+        CacheKey              key;
+        std::vector<IPAddress> addresses;
+        TimePoint             expiry;
+        bool                  chance{true};
     };
 
     using Index = std::unordered_map<CacheKey, size_t, CacheKeyHash>;
 
-    void replace_slot(size_t slot_index, CacheKey key, IPAddress address, TimePoint expiry);
+    void replace_slot(size_t slot_index, CacheKey key, std::vector<IPAddress> addresses, TimePoint expiry);
 
     size_t                                 capacity_{0};
     size_t                                 hand_{0};

@@ -74,6 +74,54 @@ WriteResult write_question_message(const Header &header, std::span<const Questio
     return std::move(writer).take();
 }
 
+WriteResult write_address_message(const Header                     &header,
+                                  const Question                   &question,
+                                  std::span<const AddressAnswerView> answers,
+                                  uint32_t                           ttl,
+                                  size_t                             maximum_size)
+{
+    if (maximum_size > 65'535)
+        return write_failure(WriteErrorCode::InvalidMaximumSize);
+    if (answers.empty())
+        return write_failure(WriteErrorCode::MissingAnswers);
+    if (answers.size() > std::numeric_limits<uint16_t>::max())
+        return write_failure(WriteErrorCode::TooManyAnswers);
+
+    size_t expected_size = 0;
+    if (question.type == static_cast<uint16_t>(RecordType::A))
+        expected_size = 4;
+    else if (question.type == static_cast<uint16_t>(RecordType::AAAA))
+        expected_size = 16;
+    else
+        return write_failure(WriteErrorCode::UnsupportedAddressType);
+
+    for (const AddressAnswerView answer : answers)
+    {
+        if (answer.bytes.size() != expected_size)
+            return write_failure(WriteErrorCode::InvalidAddressLength);
+    }
+
+    auto flags = encode_flags(header);
+    if (!flags)
+        return dns::unexpected(flags.error());
+
+    detail::WireWriter writer{maximum_size};
+    if (!writer.write_u16(header.id) || !writer.write_u16(*flags) || !writer.write_u16(1) ||
+        !writer.write_u16(static_cast<uint16_t>(answers.size())) || !writer.write_u16(0) || !writer.write_u16(0) ||
+        !write_name(writer, question.name) || !writer.write_u16(question.type) || !writer.write_u16(question.question_class))
+        return write_failure(WriteErrorCode::MessageTooLarge);
+
+    for (const AddressAnswerView answer : answers)
+    {
+        // The only question starts at the fixed DNS header offset.
+        if (!writer.write_u16(0xc00cU) || !writer.write_u16(question.type) || !writer.write_u16(question.question_class) ||
+            !writer.write_u32(ttl) || !writer.write_u16(static_cast<uint16_t>(answer.bytes.size())) || !writer.write_bytes(answer.bytes))
+            return write_failure(WriteErrorCode::MessageTooLarge);
+    }
+
+    return std::move(writer).take();
+}
+
 } // namespace
 
 WriteResult serialize_query(const Header &header, std::span<const Question> questions, size_t maximum_size)
@@ -142,6 +190,28 @@ WriteResult make_format_error_response(std::span<const std::byte> malformed_requ
     }
 
     return write_question_message(response_header, {}, maximum_size);
+}
+
+WriteResult make_address_response(const Message                     &request,
+                                  std::span<const AddressAnswerView> answers,
+                                  uint32_t                           ttl,
+                                  bool                               recursion_available,
+                                  size_t                             maximum_size)
+{
+    if (request.header.is_response)
+        return write_failure(WriteErrorCode::ExpectedQuery);
+    if (request.questions.size() != 1)
+        return write_failure(WriteErrorCode::WrongQuestionCount);
+
+    Header response_header;
+    response_header.id                  = request.header.id;
+    response_header.is_response         = true;
+    response_header.opcode              = request.header.opcode;
+    response_header.recursion_desired   = request.header.recursion_desired;
+    response_header.recursion_available = recursion_available;
+    response_header.checking_disabled   = request.header.checking_disabled;
+    response_header.response_code       = static_cast<uint8_t>(ResponseCode::NoError);
+    return write_address_message(response_header, request.questions.front(), answers, ttl, maximum_size);
 }
 
 } // namespace dns::protocol

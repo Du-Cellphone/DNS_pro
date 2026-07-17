@@ -34,10 +34,12 @@ function(dns_pro_enable_sanitizers target)
 endfunction()
 
 add_library(dns_core STATIC
+    CachePolicy.cpp
     DNS.cpp
     DNS_Cache.cpp
     CuckooFilter.cpp
     DomainBlocklist.cpp
+    FilterContext.cpp
     protocol/DnsParser.cpp
     protocol/DnsQuery.cpp
     protocol/DnsResponse.cpp
@@ -96,6 +98,13 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_cache_tests)
     add_test(NAME dns_cache_tests COMMAND dns_cache_tests)
     set_tests_properties(dns_cache_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_cache_policy_tests tests/cache_policy_tests.cpp)
+    target_link_libraries(dns_cache_policy_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_cache_policy_tests)
+    dns_pro_enable_sanitizers(dns_cache_policy_tests)
+    add_test(NAME dns_cache_policy_tests COMMAND dns_cache_policy_tests)
+    set_tests_properties(dns_cache_policy_tests PROPERTIES TIMEOUT 10)
 
     add_executable(dns_lifecycle_tests tests/lifecycle_tests.cpp)
     target_link_libraries(dns_lifecycle_tests PRIVATE dns_core)

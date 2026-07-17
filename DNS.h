@@ -1,7 +1,7 @@
 #pragma once
 
 #include "DNS_Cache.h"
-#include "DomainBlocklist.h"
+#include "FilterContext.h"
 #include "WorkerLoop.h"
 
 #include <atomic>
@@ -12,20 +12,17 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <vector>
 
-struct FilterContext
-{
-    Filter::DomainBlocklist blocklist;
-};
-
 struct DNSConfig
 {
-    size_t   worker_count{1};
-    size_t   manager_count{1};
-    size_t   cache_capacity{Cache::DEFAULT_TOTAL_CAPACITY};
-    uint16_t port{5353};
+    size_t                   worker_count{1};
+    size_t                   manager_count{1};
+    size_t                   cache_capacity{Cache::DEFAULT_TOTAL_CAPACITY};
+    uint16_t                 port{5353};
+    std::vector<std::string> blocked_domains;
     dns::server::UpstreamConfig upstream{};
 };
 
@@ -64,7 +61,7 @@ private:
     State state_{State::Empty};
     DNSConfig config_{};
 
-    std::atomic<std::shared_ptr<const FilterContext>> active_context_{nullptr};
+    dns::server::FilterSnapshotSlot active_context_{nullptr};
     std::unique_ptr<Cache::DNS_Cache> cache_;
     std::vector<std::unique_ptr<dns::server::WorkerLoop>> worker_loops_;
     std::vector<std::jthread> worker_threads_;

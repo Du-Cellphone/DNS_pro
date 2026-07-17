@@ -44,8 +44,8 @@ void test_key_partitioning_and_normalization()
 
     auto a_hit = shard.get(key("www.example.com", dns::protocol::RecordType::A), now);
     auto aaaa_hit = shard.get(key("WWW.EXAMPLE.COM.", dns::protocol::RecordType::AAAA), now);
-    require(a_hit && a_hit->address == ipv4, "canonical A cache key must hit its own value");
-    require(aaaa_hit && aaaa_hit->address == ipv6, "AAAA must not overwrite A for the same name");
+    require(a_hit && a_hit->addresses == std::vector{ipv4}, "canonical A cache key must hit its own value");
+    require(aaaa_hit && aaaa_hit->addresses == std::vector{ipv6}, "AAAA must not overwrite A for the same name");
     require(!shard.get(key("www.example.com", dns::protocol::RecordType::A, dns::protocol::RecordClass::ANY), now),
             "QCLASS must participate in the cache key");
 }
@@ -67,10 +67,27 @@ void test_ttl_boundaries_and_updates()
     shard.put(cache_key, second, 20, now + 1s);
     require(shard.size() == 1, "updating an existing key must not grow the cache");
     auto updated = shard.get(cache_key, now + 2s);
-    require(updated && updated->address == second && updated->remaining_ttl == 19, "updates must replace value and restart TTL from the new timestamp");
+    require(updated && updated->addresses == std::vector{second} && updated->remaining_ttl == 19,
+            "updates must replace value and restart TTL from the new timestamp");
 
     shard.put(cache_key, first, 0, now + 3s);
     require(!shard.get(cache_key, now + 3s) && shard.size() == 0, "TTL zero must invalidate an existing cache entry");
+}
+
+void test_address_rrsets_are_kept_together()
+{
+    Cache::CacheShard shard{2};
+    const auto        now       = Cache::TimePoint{};
+    const auto        cache_key = key("rrset.example", dns::protocol::RecordType::A);
+    const std::vector addresses{Cache::IPAddress::v4({192, 0, 2, 1}), Cache::IPAddress::v4({192, 0, 2, 2})};
+
+    shard.put(cache_key, addresses, 30, now);
+    auto hit = shard.get(cache_key, now + 5s);
+    require(hit && hit->addresses == addresses && hit->remaining_ttl == 25,
+            "a multi-address RRset must remain ordered and share its conservative TTL");
+
+    shard.put(cache_key, std::vector<Cache::IPAddress>{}, 30, now + 6s);
+    require(!shard.get(cache_key, now + 6s), "an empty RRset must invalidate rather than create an unusable cache entry");
 }
 
 void test_capacity_and_clock_eviction()
@@ -133,6 +150,7 @@ int main()
 {
     test_key_partitioning_and_normalization();
     test_ttl_boundaries_and_updates();
+    test_address_rrsets_are_kept_together();
     test_capacity_and_clock_eviction();
     test_shard_distribution_and_isolation();
     std::cout << "all cache tests passed\n";

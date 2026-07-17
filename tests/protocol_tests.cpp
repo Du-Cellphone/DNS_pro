@@ -537,6 +537,63 @@ void test_error_response_writer()
             "DNS messages cannot use a size limit wider than the 16-bit protocol maximum");
 }
 
+void test_address_response_writer()
+{
+    auto request = parse_message(mixed_case_a_query());
+    require(request.has_value(), "address response fixture must parse");
+    request->header.id                = 0xabcd;
+    request->header.checking_disabled = true;
+
+    const std::array first{std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1}};
+    const std::array second{std::byte{192}, std::byte{0}, std::byte{2}, std::byte{2}};
+    const std::array answers{AddressAnswerView{first}, AddressAnswerView{second}};
+    auto             wire = make_address_response(*request, answers, 17);
+    require(wire.has_value(), "a cached A RRset must serialize");
+
+    auto response = parse_message(*wire);
+    require(response && response->header.id == 0xabcd && response->header.is_response,
+            "an address response must use the current client transaction ID and set QR");
+    require(response->header.recursion_desired && response->header.recursion_available && response->header.checking_disabled,
+            "an address response must preserve RD/CD and advertise recursion availability");
+    require(response->questions == request->questions && response->questions.front().name.to_string() == "WWW.ExAmple.COM",
+            "a cache hit must echo the current question spelling instead of an older cached query");
+    require(response->answers.size() == 2 && response->answers[0].name == request->questions.front().name &&
+                response->answers[1].name == request->questions.front().name,
+            "every cached address must be emitted as one direct answer for the requested owner");
+    require(response->answers[0].ttl == 17 && response->answers[1].ttl == 17 && response->answers[0].rdata == std::vector(first.begin(), first.end()) &&
+                response->answers[1].rdata == std::vector(second.begin(), second.end()),
+            "a cached RRset must preserve address order and use its remaining TTL");
+
+    const std::array invalid{AddressAnswerView{std::span<const std::byte>{first}.first(3)}};
+    auto             invalid_length = make_address_response(*request, invalid, 10);
+    require(!invalid_length && invalid_length.error().code == WriteErrorCode::InvalidAddressLength,
+            "an A cache response must reject non-four-byte RDATA");
+    auto no_answers = make_address_response(*request, std::span<const AddressAnswerView>{}, 10);
+    require(!no_answers && no_answers.error().code == WriteErrorCode::MissingAnswers, "an empty positive response must not serialize");
+
+    Message unsupported = *request;
+    unsupported.questions.front().type = static_cast<uint16_t>(RecordType::MX);
+    auto unsupported_type = make_address_response(unsupported, answers, 10);
+    require(!unsupported_type && unsupported_type.error().code == WriteErrorCode::UnsupportedAddressType,
+            "the positive cache writer must remain limited to A and AAAA");
+
+    Message aaaa_request = *request;
+    aaaa_request.questions.front().type = static_cast<uint16_t>(RecordType::AAAA);
+    std::array<std::byte, 16> ipv6{};
+    ipv6[15] = std::byte{1};
+    const std::array aaaa_answers{AddressAnswerView{ipv6}};
+    auto             aaaa_wire = make_address_response(aaaa_request, aaaa_answers, 30);
+    require(aaaa_wire.has_value(), "a cached AAAA RRset must serialize");
+    auto aaaa = parse_message(*aaaa_wire);
+    require(aaaa && aaaa->answers.size() == 1 && aaaa->answers.front().type == static_cast<uint16_t>(RecordType::AAAA) &&
+                aaaa->answers.front().rdata.size() == 16,
+            "a cached AAAA response must use sixteen-byte RDATA");
+
+    auto too_small = make_address_response(*request, answers, 10, true, kDnsHeaderSize);
+    require(!too_small && too_small.error().code == WriteErrorCode::MessageTooLarge,
+            "address response capacity failure must not return a partial packet");
+}
+
 void test_deterministic_robustness_corpus()
 {
     const std::array corpus{mixed_case_a_query(), compressed_a_response()};
@@ -570,6 +627,7 @@ int main()
     test_truncation_counts_and_limits();
     test_mvp_policy_validation();
     test_error_response_writer();
+    test_address_response_writer();
     test_deterministic_robustness_corpus();
 
     std::cout << "all protocol tests passed\n";

@@ -1,5 +1,6 @@
 #include "WorkerLoop.h"
 
+#include "CachePolicy.h"
 #include "protocol/DnsParser.h"
 #include "protocol/DnsQuery.h"
 #include "protocol/DnsWriter.h"
@@ -27,6 +28,27 @@ namespace
 Unexpected<WorkerInitError> init_failure(WorkerInitStep step) noexcept
 {
     return dns::unexpected(WorkerInitError{step, errno});
+}
+
+protocol::WriteResult make_cache_hit_response(const protocol::Message &request, const Cache::CacheHit &hit, size_t maximum_size)
+{
+    if (request.questions.size() != 1)
+        return dns::unexpected(protocol::WriteError{protocol::WriteErrorCode::WrongQuestionCount});
+
+    const uint16_t type = request.questions.front().type;
+    std::vector<protocol::AddressAnswerView> answers;
+    answers.reserve(hit.addresses.size());
+    for (const Cache::IPAddress &address : hit.addresses)
+    {
+        const auto bytes = std::as_bytes(std::span{address.bytes});
+        if (type == static_cast<uint16_t>(protocol::RecordType::A) && address.is_v4())
+            answers.push_back(protocol::AddressAnswerView{bytes.first(4)});
+        else if (type == static_cast<uint16_t>(protocol::RecordType::AAAA) && address.is_v6())
+            answers.push_back(protocol::AddressAnswerView{bytes});
+        else
+            return dns::unexpected(protocol::WriteError{protocol::WriteErrorCode::InvalidAddressLength});
+    }
+    return protocol::make_address_response(request, answers, hit.remaining_ttl, true, maximum_size);
 }
 
 } // namespace
@@ -74,7 +96,20 @@ DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet
 
 WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config)
 {
-    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard}};
+    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, nullptr}};
+    auto initialized = worker->initialize(port, upstream_config);
+    if (!initialized)
+        return dns::unexpected(initialized.error());
+    return worker;
+}
+
+WorkerLoop::CreateResult WorkerLoop::create(size_t                  worker_id,
+                                            uint16_t                port,
+                                            Cache::CacheShard      &cache_shard,
+                                            const FilterSnapshotSlot &filter_snapshots,
+                                            const UpstreamConfig   &upstream_config)
+{
+    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, &filter_snapshots}};
     auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
         return dns::unexpected(initialized.error());
@@ -421,11 +456,83 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                 co_return;
             }
 
-            if (upstream_usable_)
+            const protocol::Question &question = decision.request->questions.front();
+            if (filter_snapshots_ != nullptr)
             {
-                auto upstream_result = co_await upstream_channel_.query(decision.request->header, decision.request->questions.front());
-                if (upstream_result.outcome == dns::upstream::QueryOutcome::Response)
-                    decision.response = std::move(upstream_result.response);
+                const FilterSnapshot snapshot = filter_snapshots_->load(std::memory_order_acquire);
+                if (snapshot && snapshot->blocklist.matches(question.name))
+                {
+                    ++stats_.blocked_queries;
+                    auto refused = protocol::make_error_response(*decision.request, protocol::ResponseCode::Refused, true, kMaximumDatagramSize);
+                    if (!refused)
+                    {
+                        ++stats_.internal_errors;
+                        co_return;
+                    }
+                    decision.response = std::move(*refused);
+                }
+            }
+
+            if (decision.response.empty())
+            {
+                const bool cache_eligible = cache_shard_.capacity() != 0 && !decision.request->header.authenticated_data &&
+                                            !decision.request->header.checking_disabled;
+                std::optional<Cache::CacheKey> cache_key;
+                if (cache_eligible)
+                {
+                    cache_key.emplace(question.name, question.type, question.question_class);
+                    auto cache_hit = cache_shard_.get(*cache_key, Cache::Clock::now());
+                    if (cache_hit)
+                    {
+                        ++stats_.cache_hits;
+                        auto response = make_cache_hit_response(*decision.request, *cache_hit, kMaximumDatagramSize);
+                        if (!response)
+                        {
+                            ++stats_.internal_errors;
+                            co_return;
+                        }
+                        decision.response = std::move(*response);
+                    }
+                    else
+                    {
+                        ++stats_.cache_misses;
+                    }
+                }
+                else
+                {
+                    ++stats_.cache_bypasses;
+                }
+
+                if (decision.response.empty() && upstream_usable_)
+                {
+                    auto upstream_result = co_await upstream_channel_.query(decision.request->header, question);
+                    if (upstream_result.outcome == dns::upstream::QueryOutcome::Response)
+                    {
+                        decision.response = std::move(upstream_result.response);
+                        if (cache_key)
+                        {
+                            try
+                            {
+                                auto parsed_response = protocol::parse_message(decision.response);
+                                if (parsed_response)
+                                {
+                                    auto cacheable = cacheable_address_set(*parsed_response, question);
+                                    if (cacheable)
+                                    {
+                                        cache_shard_.put(std::move(*cache_key), std::move(cacheable->addresses), cacheable->ttl,
+                                                         Cache::Clock::now());
+                                        ++stats_.cache_inserts;
+                                    }
+                                }
+                            }
+                            catch (const std::exception &error)
+                            {
+                                ++stats_.internal_errors;
+                                std::cerr << "worker " << worker_id_ << " could not cache an upstream response: " << error.what() << '\n';
+                            }
+                        }
+                    }
+                }
             }
             if (decision.response.empty())
             {
