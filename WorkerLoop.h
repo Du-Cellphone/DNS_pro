@@ -104,7 +104,7 @@ struct DatagramDecision
 class WorkerLoop final
 {
 public:
-    using CreateResult = Expected<std::unique_ptr<WorkerLoop>, WorkerInitError>;
+    using CreateResult = std::expected<std::unique_ptr<WorkerLoop>, WorkerInitError>;
 
     static CreateResult create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
     static CreateResult create(size_t                  worker_id,
@@ -154,7 +154,7 @@ private:
     {
     }
 
-    Expected<void, WorkerInitError> initialize(uint16_t port, const UpstreamConfig &upstream_config);
+    std::expected<void, WorkerInitError> initialize(uint16_t port, const UpstreamConfig &upstream_config);
     void                            drain_wakeup() const noexcept;
     void                            drain_listener(std::stop_token stop_token) noexcept;
     runtime::Task<void>             process_datagram(ClientDatagram datagram);

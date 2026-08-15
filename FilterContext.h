@@ -32,7 +32,7 @@ struct FilterContext final
 
 using FilterSnapshot      = std::shared_ptr<const FilterContext>;
 using FilterSnapshotSlot  = std::atomic<FilterSnapshot>;
-using FilterSnapshotBuild = Expected<FilterSnapshot, Filter::BlocklistBuildError>;
+using FilterSnapshotBuild = std::expected<FilterSnapshot, Filter::BlocklistBuildError>;
 
 FilterSnapshotBuild build_filter_snapshot(std::span<const std::string> rules, FilterGeneration generation, std::stop_token stop_token = {});
 

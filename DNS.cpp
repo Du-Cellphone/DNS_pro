@@ -9,7 +9,7 @@ namespace
 
 dns::server::FilterUpdateResult filter_update_error(dns::server::FilterUpdateErrorCode code)
 {
-    return dns::unexpected(dns::server::FilterUpdateError{code, std::nullopt});
+    return std::unexpected(dns::server::FilterUpdateError{code, std::nullopt});
 }
 
 } // namespace

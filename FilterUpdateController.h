@@ -47,7 +47,7 @@ struct FilterUpdateError
     bool operator==(const FilterUpdateError &) const = default;
 };
 
-using FilterUpdateResult = Expected<FilterVersion, FilterUpdateError>;
+using FilterUpdateResult = std::expected<FilterVersion, FilterUpdateError>;
 using FilterUpdateFuture = std::future<FilterUpdateResult>;
 
 class FilterUpdateController final

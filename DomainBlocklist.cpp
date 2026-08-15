@@ -39,10 +39,11 @@ DomainBlocklist::DomainBlocklist(size_t bucket_count)
 {
 }
 
-dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules, std::stop_token stop_token)
+std::expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules,
+                                                                          std::stop_token                stop_token)
 {
     if (stop_token.stop_requested())
-        return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
+        return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
 
     std::vector<dns::protocol::DomainName> canonical_rules;
     canonical_rules.reserve(rules.size());
@@ -52,15 +53,15 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
     for (size_t index = 0; index < rules.size(); ++index)
     {
         if (stop_token.stop_requested())
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
 
         auto name = dns::protocol::DomainName::from_text(rules[index]);
         if (!name)
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::InvalidDomain, index});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::InvalidDomain, index});
         if (name->is_root())
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::RootRuleNotAllowed, index});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::RootRuleNotAllowed, index});
         if (contains_unsupported_wildcard(*name))
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::WildcardNotSupported, index});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::WildcardNotSupported, index});
 
         std::string key{name->canonical_key()};
         if (unique_rules.insert(key).second)
@@ -71,14 +72,14 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
     while (true)
     {
         if (stop_token.stop_requested())
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
 
         DomainBlocklist candidate{bucket_count};
         bool            inserted_all = true;
         for (size_t index = 0; index < canonical_rules.size(); ++index)
         {
             if (stop_token.stop_requested())
-                return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+                return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
             const auto &name = canonical_rules[index];
             if (!candidate.prefilter_.insert(name.canonical_key()))
             {
@@ -92,7 +93,7 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
             for (size_t index = 0; index < canonical_rules.size(); ++index)
             {
                 if (stop_token.stop_requested())
-                    return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
+                    return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, index});
                 candidate.tree_.insert(canonical_rules[index]);
             }
             candidate.rule_count_ = canonical_rules.size();
@@ -100,7 +101,7 @@ dns::Expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
         }
 
         if (bucket_count > std::numeric_limits<size_t>::max() / 2)
-            return dns::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::CapacityOverflow, 0});
+            return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::CapacityOverflow, 0});
         bucket_count *= 2;
     }
 }

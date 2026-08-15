@@ -27,7 +27,7 @@ struct ResponseValidationError
     bool operator==(const ResponseValidationError &) const = default;
 };
 
-using ResponseValidationResult = Expected<void, ResponseValidationError>;
+using ResponseValidationResult = std::expected<void, ResponseValidationError>;
 
 [[nodiscard]] std::optional<uint16_t> transaction_id(std::span<const std::byte> packet) noexcept;
 

@@ -39,7 +39,8 @@ public:
     DomainBlocklist(const DomainBlocklist &)                = delete;
     DomainBlocklist &operator=(const DomainBlocklist &)     = delete;
 
-    static dns::Expected<DomainBlocklist, BlocklistBuildError> build(std::span<const std::string> rules, std::stop_token stop_token = {});
+    static std::expected<DomainBlocklist, BlocklistBuildError> build(std::span<const std::string> rules,
+                                                                     std::stop_token                stop_token = {});
 
     [[nodiscard]] bool   matches(const dns::protocol::DomainName &query) const noexcept;
     [[nodiscard]] bool   matches(std::string_view query) const;

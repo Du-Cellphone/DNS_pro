@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/Expected.h"
 #include "protocol/DnsMessage.h"
 
 #include <cstddef>
@@ -47,7 +48,7 @@ struct ParseLimits
     bool   reject_trailing_data{true};
 };
 
-using ParseResult = Expected<Message, ParseError>;
+using ParseResult = std::expected<Message, ParseError>;
 
 ParseResult parse_message(std::span<const std::byte> packet, const ParseLimits &limits = {});
 

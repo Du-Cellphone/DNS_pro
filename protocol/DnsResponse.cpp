@@ -5,9 +5,9 @@ namespace dns::protocol
 namespace
 {
 
-Unexpected<ResponseValidationError> validation_failure(ResponseValidationErrorCode code)
+std::unexpected<ResponseValidationError> validation_failure(ResponseValidationErrorCode code)
 {
-    return dns::unexpected(ResponseValidationError{code});
+    return std::unexpected(ResponseValidationError{code});
 }
 
 } // namespace

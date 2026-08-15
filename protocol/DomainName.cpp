@@ -66,7 +66,7 @@ bool labels_equal_canonical(std::string_view lhs, std::string_view rhs) noexcept
 
 } // namespace
 
-Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view text)
+std::expected<DomainName, DomainNameError> DomainName::from_text(std::string_view text)
 {
     if (text.empty() || text == ".")
         return DomainName{};
@@ -80,7 +80,7 @@ Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view tex
         if (value == '.')
         {
             if (label.empty())
-                return dns::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, labels.size()});
+                return std::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, labels.size()});
             labels.push_back(std::move(label));
             label.clear();
             if (index + 1 == text.size())
@@ -95,7 +95,7 @@ Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view tex
         }
 
         if (index + 1 >= text.size())
-            return dns::unexpected(DomainNameError{DomainNameErrorCode::InvalidEscape, labels.size()});
+            return std::unexpected(DomainNameError{DomainNameErrorCode::InvalidEscape, labels.size()});
 
         const size_t remaining = text.size() - (index + 1);
         if (remaining >= 3 && is_ascii_digit(text[index + 1]) && is_ascii_digit(text[index + 2]) && is_ascii_digit(text[index + 3]))
@@ -104,7 +104,7 @@ Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view tex
                                       static_cast<unsigned int>(text[index + 2] - '0') * 10U +
                                       static_cast<unsigned int>(text[index + 3] - '0');
             if (byte > 255U)
-                return dns::unexpected(DomainNameError{DomainNameErrorCode::InvalidEscape, labels.size()});
+                return std::unexpected(DomainNameError{DomainNameErrorCode::InvalidEscape, labels.size()});
             label.push_back(static_cast<char>(byte));
             index += 3;
         }
@@ -117,7 +117,7 @@ Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view tex
     if (label.empty())
     {
         if (labels.empty())
-            return dns::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, labels.size()});
+            return std::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, labels.size()});
         return from_labels(std::move(labels));
     }
 
@@ -125,7 +125,7 @@ Expected<DomainName, DomainNameError> DomainName::from_text(std::string_view tex
     return from_labels(std::move(labels));
 }
 
-Expected<DomainName, DomainNameError> DomainName::from_labels(std::vector<std::string> labels)
+std::expected<DomainName, DomainNameError> DomainName::from_labels(std::vector<std::string> labels)
 {
     size_t      wire_size = 1;
     std::string canonical_key;
@@ -134,11 +134,11 @@ Expected<DomainName, DomainNameError> DomainName::from_labels(std::vector<std::s
     {
         const std::string &label = labels[index];
         if (label.empty())
-            return dns::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, index});
+            return std::unexpected(DomainNameError{DomainNameErrorCode::EmptyLabel, index});
         if (label.size() > kMaxLabelSize)
-            return dns::unexpected(DomainNameError{DomainNameErrorCode::LabelTooLong, index});
+            return std::unexpected(DomainNameError{DomainNameErrorCode::LabelTooLong, index});
         if (wire_size > kMaxDomainWireSize - (label.size() + 1))
-            return dns::unexpected(DomainNameError{DomainNameErrorCode::NameTooLong, index});
+            return std::unexpected(DomainNameError{DomainNameErrorCode::NameTooLong, index});
 
         wire_size += label.size() + 1;
     }

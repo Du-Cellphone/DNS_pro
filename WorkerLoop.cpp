@@ -25,15 +25,15 @@ namespace dns::server
 namespace
 {
 
-Unexpected<WorkerInitError> init_failure(WorkerInitStep step) noexcept
+std::unexpected<WorkerInitError> init_failure(WorkerInitStep step) noexcept
 {
-    return dns::unexpected(WorkerInitError{step, errno});
+    return std::unexpected(WorkerInitError{step, errno});
 }
 
 protocol::WriteResult make_cache_hit_response(const protocol::Message &request, const Cache::CacheHit &hit, size_t maximum_size)
 {
     if (request.questions.size() != 1)
-        return dns::unexpected(protocol::WriteError{protocol::WriteErrorCode::WrongQuestionCount});
+        return std::unexpected(protocol::WriteError{protocol::WriteErrorCode::WrongQuestionCount});
 
     const uint16_t type = request.questions.front().type;
     std::vector<protocol::AddressAnswerView> answers;
@@ -46,7 +46,7 @@ protocol::WriteResult make_cache_hit_response(const protocol::Message &request, 
         else if (type == static_cast<uint16_t>(protocol::RecordType::AAAA) && address.is_v6())
             answers.push_back(protocol::AddressAnswerView{bytes});
         else
-            return dns::unexpected(protocol::WriteError{protocol::WriteErrorCode::InvalidAddressLength});
+            return std::unexpected(protocol::WriteError{protocol::WriteErrorCode::InvalidAddressLength});
     }
     return protocol::make_address_response(request, answers, hit.remaining_ttl, true, maximum_size);
 }
@@ -99,7 +99,7 @@ WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cac
     auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, nullptr}};
     auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
-        return dns::unexpected(initialized.error());
+        return std::unexpected(initialized.error());
     return worker;
 }
 
@@ -112,11 +112,11 @@ WorkerLoop::CreateResult WorkerLoop::create(size_t                  worker_id,
     auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, &filter_snapshots}};
     auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
-        return dns::unexpected(initialized.error());
+        return std::unexpected(initialized.error());
     return worker;
 }
 
-Expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const UpstreamConfig &upstream_config)
+std::expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const UpstreamConfig &upstream_config)
 {
     runtime::UniqueFd listener{::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
     if (!listener)

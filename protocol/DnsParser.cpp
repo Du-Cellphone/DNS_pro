@@ -17,15 +17,15 @@ struct DecodedName
     size_t     next_offset{0};
 };
 
-Unexpected<ParseError> parse_failure(ParseErrorCode code, size_t offset)
+std::unexpected<ParseError> parse_failure(ParseErrorCode code, size_t offset)
 {
-    return dns::unexpected(ParseError{code, offset});
+    return std::unexpected(ParseError{code, offset});
 }
 
-Expected<DecodedName, ParseError> decode_name(std::span<const std::byte> packet,
-                                              size_t                     start,
-                                              size_t                     encoded_end,
-                                              const ParseLimits         &limits)
+std::expected<DecodedName, ParseError> decode_name(std::span<const std::byte> packet,
+                                                   size_t                     start,
+                                                   size_t                     encoded_end,
+                                                   const ParseLimits         &limits)
 {
     std::vector<std::string> labels;
     std::vector<size_t>      visited_pointers;
@@ -116,11 +116,11 @@ Expected<DecodedName, ParseError> decode_name(std::span<const std::byte> packet,
     return DecodedName{std::move(*name), next_offset};
 }
 
-Expected<Question, ParseError> parse_question(std::span<const std::byte> packet, size_t &offset, const ParseLimits &limits)
+std::expected<Question, ParseError> parse_question(std::span<const std::byte> packet, size_t &offset, const ParseLimits &limits)
 {
     auto decoded_name = decode_name(packet, offset, packet.size(), limits);
     if (!decoded_name)
-        return dns::unexpected(decoded_name.error());
+        return std::unexpected(decoded_name.error());
 
     detail::WireReader reader{packet, decoded_name->next_offset};
     Question           question;
@@ -132,11 +132,13 @@ Expected<Question, ParseError> parse_question(std::span<const std::byte> packet,
     return question;
 }
 
-Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::byte> packet, size_t &offset, const ParseLimits &limits)
+std::expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::byte> packet,
+                                                                 size_t                    &offset,
+                                                                 const ParseLimits         &limits)
 {
     auto decoded_name = decode_name(packet, offset, packet.size(), limits);
     if (!decoded_name)
-        return dns::unexpected(decoded_name.error());
+        return std::unexpected(decoded_name.error());
 
     detail::WireReader reader{packet, decoded_name->next_offset};
     ResourceRecord     record;
@@ -150,10 +152,10 @@ Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::
         return parse_failure(ParseErrorCode::UnexpectedEnd, reader.offset());
 
     const size_t rdata_end = reader.offset();
-    const auto   validate_single_name = [&](size_t name_offset, size_t required_end) -> Expected<void, ParseError> {
+    const auto validate_single_name = [&](size_t name_offset, size_t required_end) -> std::expected<void, ParseError> {
         auto decoded = decode_name(packet, name_offset, required_end, limits);
         if (!decoded)
-            return dns::unexpected(decoded.error());
+            return std::unexpected(decoded.error());
         if (decoded->next_offset != required_end)
             return parse_failure(ParseErrorCode::InvalidRdata, decoded->next_offset);
         return {};
@@ -201,7 +203,7 @@ Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::
         {
             auto result = validate_single_name(record.rdata_offset, rdata_end);
             if (!result)
-                return dns::unexpected(result.error());
+                return std::unexpected(result.error());
             break;
         }
         case RecordType::MX:
@@ -210,17 +212,17 @@ Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::
                 return parse_failure(ParseErrorCode::InvalidRdata, record.rdata_offset);
             auto result = validate_single_name(record.rdata_offset + 2, rdata_end);
             if (!result)
-                return dns::unexpected(result.error());
+                return std::unexpected(result.error());
             break;
         }
         case RecordType::SOA:
         {
             auto primary_name = decode_name(packet, record.rdata_offset, rdata_end, limits);
             if (!primary_name)
-                return dns::unexpected(primary_name.error());
+                return std::unexpected(primary_name.error());
             auto mailbox_name = decode_name(packet, primary_name->next_offset, rdata_end, limits);
             if (!mailbox_name)
-                return dns::unexpected(mailbox_name.error());
+                return std::unexpected(mailbox_name.error());
             if (mailbox_name->next_offset > rdata_end || rdata_end - mailbox_name->next_offset != 20)
                 return parse_failure(ParseErrorCode::InvalidRdata, mailbox_name->next_offset);
             break;
@@ -229,10 +231,10 @@ Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::
         {
             auto responsible_mailbox = decode_name(packet, record.rdata_offset, rdata_end, limits);
             if (!responsible_mailbox)
-                return dns::unexpected(responsible_mailbox.error());
+                return std::unexpected(responsible_mailbox.error());
             auto result = validate_single_name(responsible_mailbox->next_offset, rdata_end);
             if (!result)
-                return dns::unexpected(result.error());
+                return std::unexpected(result.error());
             break;
         }
         case RecordType::HINFO:
@@ -254,14 +256,14 @@ Expected<ResourceRecord, ParseError> parse_resource_record(std::span<const std::
 }
 
 template <typename Item, typename Parser>
-Expected<void, ParseError> parse_section(std::vector<Item> &output, uint16_t count, Parser &&parser)
+std::expected<void, ParseError> parse_section(std::vector<Item> &output, uint16_t count, Parser &&parser)
 {
     output.reserve(count);
     for (uint16_t index = 0; index < count; ++index)
     {
         auto item = parser();
         if (!item)
-            return dns::unexpected(item.error());
+            return std::unexpected(item.error());
         output.push_back(std::move(*item));
     }
     return {};
@@ -311,18 +313,18 @@ ParseResult parse_message(std::span<const std::byte> packet, const ParseLimits &
 
     auto questions_result = parse_section(message.questions, question_count, [&]() { return parse_question(packet, offset, limits); });
     if (!questions_result)
-        return dns::unexpected(questions_result.error());
+        return std::unexpected(questions_result.error());
 
     auto parse_rr = [&]() { return parse_resource_record(packet, offset, limits); };
     auto answers_result = parse_section(message.answers, answer_count, parse_rr);
     if (!answers_result)
-        return dns::unexpected(answers_result.error());
+        return std::unexpected(answers_result.error());
     auto authorities_result = parse_section(message.authorities, authority_count, parse_rr);
     if (!authorities_result)
-        return dns::unexpected(authorities_result.error());
+        return std::unexpected(authorities_result.error());
     auto additionals_result = parse_section(message.additionals, additional_count, parse_rr);
     if (!additionals_result)
-        return dns::unexpected(additionals_result.error());
+        return std::unexpected(additionals_result.error());
 
     if (limits.reject_trailing_data && offset != packet.size())
         return parse_failure(ParseErrorCode::TrailingData, offset);

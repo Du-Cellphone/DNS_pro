@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/Expected.h"
 #include "protocol/DnsMessage.h"
 
 #include <cstddef>
@@ -32,11 +33,11 @@ struct WriteError
     bool operator==(const WriteError &) const = default;
 };
 
-using WriteResult = Expected<std::vector<std::byte>, WriteError>;
+using WriteResult = std::expected<std::vector<std::byte>, WriteError>;
 
 WriteResult serialize_query(const Header &header, std::span<const Question> questions, size_t maximum_size = 65'535);
 
-Expected<void, WriteError> rewrite_transaction_id(std::span<std::byte> packet, uint16_t transaction_id) noexcept;
+std::expected<void, WriteError> rewrite_transaction_id(std::span<std::byte> packet, uint16_t transaction_id) noexcept;
 
 WriteResult make_error_response(const Message &request,
                                 ResponseCode  response_code,

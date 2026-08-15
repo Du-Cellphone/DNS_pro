@@ -10,9 +10,9 @@ FilterSnapshotBuild build_filter_snapshot(std::span<const std::string> rules, Fi
 {
     auto blocklist = Filter::DomainBlocklist::build(rules, stop_token);
     if (!blocklist)
-        return dns::unexpected(blocklist.error());
+        return std::unexpected(blocklist.error());
     if (stop_token.stop_requested())
-        return dns::unexpected(Filter::BlocklistBuildError{Filter::BlocklistBuildErrorCode::Cancelled, 0});
+        return std::unexpected(Filter::BlocklistBuildError{Filter::BlocklistBuildErrorCode::Cancelled, 0});
     return std::make_shared<const FilterContext>(generation, std::move(*blocklist));
 }
 

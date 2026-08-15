@@ -10,12 +10,12 @@ namespace dns::protocol
 namespace
 {
 
-Unexpected<WriteError> write_failure(WriteErrorCode code)
+std::unexpected<WriteError> write_failure(WriteErrorCode code)
 {
-    return dns::unexpected(WriteError{code});
+    return std::unexpected(WriteError{code});
 }
 
-Expected<uint16_t, WriteError> encode_flags(const Header &header)
+std::expected<uint16_t, WriteError> encode_flags(const Header &header)
 {
     if (header.opcode > 0x0fU)
         return write_failure(WriteErrorCode::InvalidOpcode);
@@ -58,7 +58,7 @@ WriteResult write_question_message(const Header &header, std::span<const Questio
 
     auto flags = encode_flags(header);
     if (!flags)
-        return dns::unexpected(flags.error());
+        return std::unexpected(flags.error());
 
     detail::WireWriter writer{maximum_size};
     if (!writer.write_u16(header.id) || !writer.write_u16(*flags) || !writer.write_u16(static_cast<uint16_t>(questions.size())) ||
@@ -103,7 +103,7 @@ WriteResult write_address_message(const Header                     &header,
 
     auto flags = encode_flags(header);
     if (!flags)
-        return dns::unexpected(flags.error());
+        return std::unexpected(flags.error());
 
     detail::WireWriter writer{maximum_size};
     if (!writer.write_u16(header.id) || !writer.write_u16(*flags) || !writer.write_u16(1) ||
@@ -137,7 +137,7 @@ WriteResult serialize_query(const Header &header, std::span<const Question> ques
     return write_question_message(query_header, questions, maximum_size);
 }
 
-Expected<void, WriteError> rewrite_transaction_id(std::span<std::byte> packet, uint16_t transaction_id) noexcept
+std::expected<void, WriteError> rewrite_transaction_id(std::span<std::byte> packet, uint16_t transaction_id) noexcept
 {
     if (packet.size() < sizeof(transaction_id))
         return write_failure(WriteErrorCode::MissingTransactionId);

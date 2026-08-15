@@ -11,7 +11,7 @@ namespace
 
 FilterUpdateResult update_error(FilterUpdateErrorCode code, std::optional<Filter::BlocklistBuildError> build_error = std::nullopt)
 {
-    return dns::unexpected(FilterUpdateError{code, std::move(build_error)});
+    return std::unexpected(FilterUpdateError{code, std::move(build_error)});
 }
 
 } // namespace
