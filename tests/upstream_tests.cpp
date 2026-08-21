@@ -1,9 +1,11 @@
+#include "protocol/DnsLimits.h"
 #include "protocol/DnsParser.h"
 #include "protocol/DnsWriter.h"
 #include "runtime/Scheduler.h"
 #include "runtime/Task.h"
 #include "runtime/TimerQueue.h"
 #include "runtime/UniqueFd.h"
+#include "tests/SocketTestSupport.h"
 #include "upstream/UpstreamChannel.h"
 
 #include <array>
@@ -44,21 +46,6 @@ void require(bool condition, std::string_view message)
 void require_spawned(Scheduler::SpawnResult result, std::string_view message)
 {
     require(result == Scheduler::SpawnResult::Spawned, message);
-}
-
-bool datagram_io_available()
-{
-    int sockets[2]{-1, -1};
-    require(::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets) == 0, "datagram capability probe must create a socket pair");
-    dns::runtime::UniqueFd first{sockets[0]};
-    dns::runtime::UniqueFd second{sockets[1]};
-    const std::byte        value{0x5a};
-    if (::send(first.get(), &value, sizeof(value), 0) == static_cast<ssize_t>(sizeof(value)))
-        return true;
-    if (errno == EPERM || errno == EACCES)
-        return false;
-    require(false, "datagram capability probe failed unexpectedly");
-    return false;
 }
 
 dns::protocol::Question make_question(std::string_view text, dns::protocol::RecordType type = dns::protocol::RecordType::A)
@@ -129,9 +116,9 @@ public:
 
     Datagram receive_query()
     {
-        std::array<std::byte, UpstreamChannel::kMaximumPacketSize> buffer{};
-        Datagram                                                   datagram;
-        const ssize_t                                              received = ::recv(upstream_socket_.get(), buffer.data(), buffer.size(), 0);
+        std::array<std::byte, dns::protocol::kUpstreamReceiveBufferSize> buffer{};
+        Datagram                                                     datagram;
+        const ssize_t received = ::recv(upstream_socket_.get(), buffer.data(), buffer.size(), 0);
         if (received <= 0)
         {
             std::cerr << "fake upstream receive failed, errno=" << errno << '\n';
@@ -193,6 +180,63 @@ std::vector<std::byte> make_wrong_question_response(std::span<const std::byte> f
     auto response              = dns::protocol::make_error_response(*request, dns::protocol::ResponseCode::NoError);
     require(response.has_value(), "invalid-response fixture must serialize");
     return std::move(*response);
+}
+
+std::vector<std::byte> make_valid_response_of_size(std::span<const std::byte> forwarded_query, size_t target_size)
+{
+    auto response = make_valid_response(forwarded_query);
+
+    // Append one private-use RR with a root owner. Its RDATA is intentionally
+    // opaque, so the fixture can produce every wire size while remaining a
+    // syntactically valid classic DNS response.
+    constexpr size_t additional_envelope_size = 11;
+    require(response.size() + additional_envelope_size <= target_size, "sized response fixture must have room for an additional RR");
+    const size_t rdata_size = target_size - response.size() - additional_envelope_size;
+    require(rdata_size <= 65'535, "sized response fixture RDATA must fit RDLENGTH");
+    response[10] = std::byte{0};
+    response[11] = std::byte{1};
+    response.push_back(std::byte{0});        // root owner
+    response.push_back(std::byte{0xff});
+    response.push_back(std::byte{0x00});     // private-use type 65280
+    response.push_back(std::byte{0});
+    response.push_back(std::byte{1});        // IN
+    response.insert(response.end(), 4, std::byte{0}); // TTL
+    response.push_back(static_cast<std::byte>((rdata_size >> 8U) & 0xffU));
+    response.push_back(static_cast<std::byte>(rdata_size & 0xffU));
+    response.insert(response.end(), rdata_size, std::byte{0x5a});
+    require(response.size() == target_size && dns::protocol::parse_message(response).has_value(),
+            "sized response fixture must remain a valid DNS message");
+    return response;
+}
+
+std::vector<dns::protocol::Question> make_exact_size_questions(size_t label_size)
+{
+    auto root = dns::protocol::DomainName::from_text(".");
+    require(root.has_value(), "root question fixture must be valid");
+
+    std::vector<dns::protocol::Question> questions;
+    questions.reserve(99);
+    for (size_t index = 0; index < 98; ++index)
+        questions.push_back(dns::protocol::Question{*root, static_cast<uint16_t>(dns::protocol::RecordType::A),
+                                                    static_cast<uint16_t>(dns::protocol::RecordClass::IN)});
+    questions.push_back(make_question(std::string(label_size, 'a')));
+    return questions;
+}
+
+void test_query_serializer_with_upstream_budget()
+{
+    const auto header = make_header(0x1122);
+
+    auto wire_511 = dns::protocol::serialize_query(header, make_exact_size_questions(3), dns::protocol::kUpstreamQueryBudget);
+    require(wire_511 && wire_511->size() == 511, "the query serializer must accept 511 bytes under the upstream budget");
+
+    auto wire_512 = dns::protocol::serialize_query(header, make_exact_size_questions(4), dns::protocol::kUpstreamQueryBudget);
+    require(wire_512 && wire_512->size() == dns::protocol::kClassicDnsUdpPayloadLimit,
+            "the query serializer must accept exactly 512 bytes under the upstream budget");
+
+    auto wire_513 = dns::protocol::serialize_query(header, make_exact_size_questions(5), dns::protocol::kUpstreamQueryBudget);
+    require(!wire_513 && wire_513.error().code == dns::protocol::WriteErrorCode::MessageTooLarge,
+            "the query serializer must reject 513 bytes under the upstream budget");
 }
 
 void test_success_restores_client_id()
@@ -289,6 +333,98 @@ void test_invalid_then_valid_response()
     require(fixture.scheduler().run_ready(1).resumed == 1 && observation.completions == 1 && observation.result &&
                 observation.result->outcome == QueryOutcome::Response,
             "valid response after an invalid packet must resume exactly once");
+    fixture.shutdown();
+}
+
+void test_classic_udp_response_boundary()
+{
+    LoopbackFixture fixture;
+
+    for (const size_t response_size : {size_t{511}, dns::protocol::kClassicDnsUdpPayloadLimit})
+    {
+        QueryObservation observation;
+        const auto       question = make_question(response_size == 511 ? "response-511.example" : "response-512.example");
+        require_spawned(fixture.scheduler().spawn(
+                            observe_query(fixture.channel(), make_header(static_cast<uint16_t>(response_size)), question,
+                                          TimerQueue::TimePoint::max(), observation)),
+                        "boundary response query must spawn");
+        require(fixture.scheduler().run_ready(1).resumed == 1 && fixture.channel().pending_count() == 1,
+                "boundary response query must become pending");
+
+        const auto request  = fixture.receive_query();
+        const auto response = make_valid_response_of_size(request.packet, response_size);
+        fixture.send_response(request, response);
+        const auto drained = fixture.channel().drain(1);
+        require(drained.datagrams == 1 && !drained.socket_error && fixture.channel().pending_count() == 0 &&
+                    fixture.scheduler().ready_count() == 1,
+                "a response at or below 512 bytes must complete its pending query");
+        require(fixture.scheduler().run_ready(1).resumed == 1 && observation.completions == 1 && observation.result &&
+                    observation.result->outcome == QueryOutcome::Response && observation.result->response.size() == response_size,
+                "the complete 511/512-byte upstream response must be returned without truncation");
+    }
+
+    require(fixture.channel().stats().responses_completed == 2 && fixture.channel().stats().invalid_responses == 0,
+            "both accepted boundary responses must be counted exactly");
+    fixture.shutdown();
+}
+
+void test_oversized_response_keeps_waiter_for_later_valid_response()
+{
+    LoopbackFixture  fixture;
+    QueryObservation observation;
+    const auto       question = make_question("oversized-then-valid.example");
+
+    require_spawned(fixture.scheduler().spawn(
+                        observe_query(fixture.channel(), make_header(0x5130), question, TimerQueue::TimePoint::max(), observation)),
+                    "oversized-then-valid query must spawn");
+    require(fixture.scheduler().run_ready(1).resumed == 1 && fixture.channel().pending_count() == 1,
+            "oversized-then-valid query must become pending");
+    const auto request = fixture.receive_query();
+
+    const auto oversized = make_valid_response_of_size(request.packet, dns::protocol::kClassicDnsUdpPayloadLimit + 1);
+    fixture.send_response(request, oversized);
+    auto drained = fixture.channel().drain(1);
+    require(drained.datagrams == 1 && !drained.socket_error && fixture.channel().stats().invalid_responses == 1 &&
+                fixture.channel().pending_count() == 1 && fixture.timers().size() == 1 && !fixture.scheduler().has_ready() &&
+                observation.completions == 0,
+            "a 513-byte upstream response must be discarded without failing or resuming its waiter");
+
+    const auto valid = make_valid_response(request.packet);
+    fixture.send_response(request, valid);
+    drained = fixture.channel().drain(1);
+    require(drained.datagrams == 1 && fixture.channel().pending_count() == 0 && fixture.scheduler().ready_count() == 1,
+            "a valid response after an oversized datagram must still match the pending query");
+    require(fixture.scheduler().run_ready(1).resumed == 1 && observation.completions == 1 && observation.result &&
+                observation.result->outcome == QueryOutcome::Response,
+            "the later valid response must complete exactly once");
+    fixture.shutdown();
+}
+
+void test_oversized_response_eventually_times_out()
+{
+    LoopbackFixture  fixture;
+    QueryObservation observation;
+    const auto       deadline = TimerQueue::TimePoint{} + 20s;
+
+    require_spawned(fixture.scheduler().spawn(observe_query(fixture.channel(), make_header(0x5131),
+                                                            make_question("oversized-timeout.example"), deadline, observation)),
+                    "oversized-timeout query must spawn");
+    require(fixture.scheduler().run_ready(1).resumed == 1 && fixture.channel().pending_count() == 1,
+            "oversized-timeout query must become pending");
+    const auto request   = fixture.receive_query();
+    const auto oversized = make_valid_response_of_size(request.packet, dns::protocol::kClassicDnsUdpPayloadLimit + 1);
+    fixture.send_response(request, oversized);
+    require(fixture.channel().drain(1).datagrams == 1 && fixture.channel().pending_count() == 1 &&
+                fixture.channel().stats().invalid_responses == 1 && !fixture.scheduler().has_ready(),
+            "an oversized response must leave the deadline armed");
+
+    const auto expired = fixture.timers().expire(deadline);
+    require(expired.dispatched == 1 && expired.schedule_failures == 0 && fixture.channel().pending_count() == 0 &&
+                fixture.scheduler().ready_count() == 1,
+            "the unchanged waiter must follow the ordinary timeout path");
+    require(fixture.scheduler().run_ready(1).resumed == 1 && observation.completions == 1 && observation.result &&
+                observation.result->outcome == QueryOutcome::Timeout && fixture.channel().stats().timeouts == 1,
+            "oversized input alone must eventually produce Timeout rather than an immediate socket failure");
     fixture.shutdown();
 }
 
@@ -411,7 +547,7 @@ void test_owner_thread_destruction_cancels_pending_query()
         "query pending during channel destruction must spawn");
     require(scheduler.run_ready(1).resumed == 1 && channel->pending_count() == 1 && timers.size() == 1,
             "destructor query must be pending before channel destruction");
-    std::array<std::byte, UpstreamChannel::kMaximumPacketSize> sent_query{};
+    std::array<std::byte, dns::protocol::kUpstreamReceiveBufferSize> sent_query{};
     require(::recv(fake_socket.get(), sent_query.data(), sent_query.size(), 0) > 0, "destructor query must reach its connected peer");
 
     channel.reset();
@@ -452,7 +588,7 @@ void test_restart_discards_stale_socket_input()
                     "first restart-cycle query must spawn");
     require(scheduler.run_ready(1).resumed == 1, "first restart-cycle query must send");
 
-    std::array<std::byte, UpstreamChannel::kMaximumPacketSize> buffer{};
+    std::array<std::byte, dns::protocol::kUpstreamReceiveBufferSize> buffer{};
     const ssize_t                                              first_size = ::recv(fake_socket.get(), buffer.data(), buffer.size(), 0);
     require(first_size > 0, "first restart-cycle query must reach its peer");
     const auto stale_response = make_valid_response(std::span<const std::byte>{buffer}.first(static_cast<size_t>(first_size)));
@@ -498,15 +634,17 @@ void test_restart_discards_stale_socket_input()
 
 int main()
 {
-    if (!datagram_io_available())
-    {
-        std::cout << "upstream channel tests skipped by sandbox\n";
-        return EXIT_SUCCESS;
-    }
+    const auto socket_capability = dns::test::probe_unix_datagram_io();
+    if (!socket_capability.available)
+        return dns::test::socket_test_unavailable_exit(socket_capability, "upstream channel tests");
 
+    test_query_serializer_with_upstream_budget();
     test_success_restores_client_id();
     test_timeout_ignores_late_response();
     test_invalid_then_valid_response();
+    test_classic_udp_response_boundary();
+    test_oversized_response_keeps_waiter_for_later_valid_response();
+    test_oversized_response_eventually_times_out();
     test_out_of_order_responses_match_their_waiters();
     test_completed_id_is_quarantined();
     test_cancel_all();

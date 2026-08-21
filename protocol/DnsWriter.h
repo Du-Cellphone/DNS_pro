@@ -44,6 +44,14 @@ WriteResult make_error_response(const Message &request,
                                 bool          recursion_available = true,
                                 size_t        maximum_size = 65'535);
 
+// Builds an error from only the available DNS header prefix. The response
+// retains ID/opcode/RD/CD when those fields are available, clears AD, and has
+// zero section counts. It rejects prefixes that identify a response.
+WriteResult make_header_only_error_response(std::span<const std::byte> request_prefix,
+                                            ResponseCode              response_code,
+                                            bool                      recursion_available = true,
+                                            size_t                    maximum_size = 65'535);
+
 WriteResult make_format_error_response(std::span<const std::byte> malformed_request,
                                        bool                       recursion_available = true,
                                        size_t                     maximum_size = 65'535);

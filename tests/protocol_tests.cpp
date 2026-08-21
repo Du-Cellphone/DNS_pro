@@ -1,3 +1,4 @@
+#include "protocol/DnsLimits.h"
 #include "protocol/DnsParser.h"
 #include "protocol/DnsQuery.h"
 #include "protocol/DnsResponse.h"
@@ -190,6 +191,61 @@ void test_query_parse_write_roundtrip()
     require(root_wire.has_value(), "a root-domain query must serialize");
     auto root_parsed = parse_message(*root_wire);
     require(root_parsed && root_parsed->questions.front().name.is_root(), "a root-domain query must round-trip");
+
+    Header dnssec_bits_header = parsed->header;
+    dnssec_bits_header.authenticated_data = true;
+    dnssec_bits_header.checking_disabled  = true;
+    auto dnssec_bits_wire = serialize_query(dnssec_bits_header, parsed->questions);
+    require(dnssec_bits_wire.has_value(), "a query carrying AD/CD must serialize");
+    auto dnssec_bits_query = parse_message(*dnssec_bits_wire);
+    require(dnssec_bits_query && dnssec_bits_query->header.authenticated_data && dnssec_bits_query->header.checking_disabled,
+            "transparent query serialization must retain AD/CD even though DNS_PRO does not validate DNSSEC");
+    require(validate_mvp_query(*dnssec_bits_query).has_value(), "AD/CD alone must not make an otherwise valid classic DNS query unsupported");
+}
+
+void test_classic_udp_serialization_limits()
+{
+    static_assert(kClassicDnsUdpPayloadLimit == 512);
+    static_assert(kDownstreamReceiveBufferSize == kClassicDnsUdpPayloadLimit);
+    static_assert(kUpstreamQueryBudget == kClassicDnsUdpPayloadLimit);
+    static_assert(kUpstreamReceiveBufferSize == kClassicDnsUdpPayloadLimit);
+    static_assert(kDownstreamResponseBudget == kClassicDnsUdpPayloadLimit);
+
+    auto first_name = DomainName::from_labels({std::string(63, 'a'), std::string(63, 'b'), std::string(63, 'c'), std::string(61, 'd')});
+    require(first_name && first_name->wire_size() == 255, "boundary fixture must contain a maximum-size domain name");
+
+    const auto make_questions = [&](size_t final_label_size) {
+        auto second_name = DomainName::from_labels(
+            {std::string(63, 'e'), std::string(63, 'f'), std::string(63, 'g'), std::string(final_label_size, 'h')});
+        require(second_name.has_value(), "boundary fixture must contain a valid second domain name");
+        return std::array{
+            Question{*first_name, static_cast<uint16_t>(RecordType::A), static_cast<uint16_t>(RecordClass::IN)},
+            Question{*second_name, static_cast<uint16_t>(RecordType::AAAA), static_cast<uint16_t>(RecordClass::IN)},
+        };
+    };
+
+    Header header;
+    const auto questions_511 = make_questions(42);
+    const auto questions_512 = make_questions(43);
+    const auto questions_513 = make_questions(44);
+
+    auto wire_511 = serialize_query(header, questions_511, kUpstreamQueryBudget);
+    require(wire_511 && wire_511->size() == 511, "a 511-byte classic UDP query must serialize");
+    auto wire_512 = serialize_query(header, questions_512, kUpstreamQueryBudget);
+    require(wire_512 && wire_512->size() == 512, "a 512-byte classic UDP query must serialize");
+    auto rejected_513 = serialize_query(header, questions_513, kUpstreamQueryBudget);
+    require(!rejected_513 && rejected_513.error().code == WriteErrorCode::MessageTooLarge,
+            "the upstream query budget must reject a 513-byte query without returning a partial packet");
+
+    auto generic_wire_513 = serialize_query(header, questions_513);
+    require(generic_wire_513 && generic_wire_513->size() == 513 && parse_message(*generic_wire_513).has_value(),
+            "generic DNS serialization and parsing must not inherit the classic UDP service limit");
+
+    ParseLimits service_limits;
+    service_limits.maximum_packet_size = kClassicDnsUdpPayloadLimit;
+    auto service_parse = parse_message(*generic_wire_513, service_limits);
+    require(!service_parse && service_parse.error().code == ParseErrorCode::PacketTooLarge,
+            "a caller may explicitly apply the classic UDP limit without changing parser defaults");
 }
 
 
@@ -473,6 +529,7 @@ void test_mvp_policy_validation()
     candidate.additionals.emplace_back();
     result = validate_mvp_query(candidate);
     require(!result && result.error().code == QueryErrorCode::ExtensionsNotSupported, "additional records are outside the MVP policy");
+    require(response_code_for(result.error().code) == ResponseCode::NotImp, "syntactically valid additional records must map to NOTIMP");
 
     candidate = *parsed;
     candidate.answers.emplace_back();
@@ -480,10 +537,66 @@ void test_mvp_policy_validation()
     require(!result && result.error().code == QueryErrorCode::UnexpectedAnswerSection, "queries with answer data must be rejected as malformed");
 }
 
+void test_additional_and_opt_policy()
+{
+    auto ordinary_additional = mixed_case_a_query();
+    ordinary_additional[11] = std::byte{1};
+    const auto address_rr = bytes({
+        0x00,                   // root owner
+        0x00, 0x01,             // A
+        0x00, 0x01,             // IN
+        0x00, 0x00, 0x00, 0x00, // TTL
+        0x00, 0x04,             // RDLENGTH
+        192, 0, 2, 1,
+    });
+    ordinary_additional.insert(ordinary_additional.end(), address_rr.begin(), address_rr.end());
+
+    auto parsed_additional = parse_message(ordinary_additional);
+    require(parsed_additional && parsed_additional->additionals.size() == 1,
+            "a syntactically valid ordinary additional RR must parse before policy validation");
+    auto additional_policy = validate_mvp_query(*parsed_additional);
+    require(!additional_policy && additional_policy.error().code == QueryErrorCode::ExtensionsNotSupported &&
+                response_code_for(additional_policy.error().code) == ResponseCode::NotImp,
+            "a valid unsupported ordinary additional RR must produce NOTIMP");
+
+    auto opt_query = mixed_case_a_query();
+    opt_query[11] = std::byte{1};
+    const auto opt_rr = bytes({
+        0x00,                   // root owner
+        0x00, 0x29,             // OPT
+        0x02, 0x00,             // advertised UDP payload size (opaque here)
+        0x00, 0x00, 0x00, 0x00, // extended fields (opaque here)
+        0x00, 0x03,             // RDLENGTH
+        0xde, 0xad, 0xbe,       // intentionally not a complete EDNS option tuple
+    });
+    opt_query.insert(opt_query.end(), opt_rr.begin(), opt_rr.end());
+
+    auto parsed_opt = parse_message(opt_query);
+    require(parsed_opt && parsed_opt->additionals.size() == 1 && parsed_opt->additionals.front().rdata == bytes({0xde, 0xad, 0xbe}),
+            "OPT RDATA must remain opaque while its RR envelope is bounds-checked");
+    auto opt_policy = validate_mvp_query(*parsed_opt);
+    require(!opt_policy && opt_policy.error().code == QueryErrorCode::ExtensionsNotSupported &&
+                response_code_for(opt_policy.error().code) == ResponseCode::NotImp,
+            "an envelope-valid unsupported OPT RR must produce NOTIMP without EDNS option parsing");
+
+    auto malformed_opt = opt_query;
+    malformed_opt[malformed_opt.size() - 4] = std::byte{4};
+    auto malformed_result = parse_message(malformed_opt);
+    require(!malformed_result && malformed_result.error().code == ParseErrorCode::UnexpectedEnd,
+            "an OPT RDLENGTH extending beyond the datagram must fail envelope parsing");
+    auto malformed_response_wire = make_format_error_response(malformed_opt, true, kDownstreamResponseBudget);
+    require(malformed_response_wire.has_value(), "a malformed OPT query with a complete header must permit FORMERR generation");
+    auto malformed_response = parse_message(*malformed_response_wire);
+    require(malformed_response && malformed_response->header.response_code == static_cast<uint8_t>(ResponseCode::FormErr),
+            "a malformed OPT RR envelope must be answerable with header-only FORMERR");
+}
+
 void test_error_response_writer()
 {
     auto request = parse_message(mixed_case_a_query());
     require(request.has_value(), "response writer fixture must parse");
+    request->header.authenticated_data = true;
+    request->header.checking_disabled  = true;
 
     auto refused_wire = make_error_response(*request, ResponseCode::Refused);
     require(refused_wire.has_value(), "a REFUSED response must serialize");
@@ -494,17 +607,20 @@ void test_error_response_writer()
     require(refused->header.response_code == static_cast<uint8_t>(ResponseCode::Refused), "an error response must set RCODE");
     require(refused->header.recursion_desired == request->header.recursion_desired, "an error response must preserve RD");
     require(refused->header.recursion_available, "the forwarder must advertise recursion availability when configured");
+    require(!refused->header.authenticated_data && refused->header.checking_disabled,
+            "a local error must clear AD while retaining the request CD bit");
     require(refused->questions == request->questions, "an error response must echo the original question and its case");
     require(refused->answers.empty() && refused->authorities.empty() && refused->additionals.empty(), "an error response must have zero RR counts");
 
-    auto malformed = bytes({0xbe, 0xef, 0x29, 0x10}); // opcode 5, RD and CD set
+    auto malformed = bytes({0xbe, 0xef, 0x29, 0x30}); // opcode 5, RD, AD, and CD set
     auto format_wire = make_format_error_response(malformed);
     require(format_wire.has_value(), "FORMERR can be generated when a transaction ID is available");
     auto format = parse_message(*format_wire);
     require(format.has_value(), "generated FORMERR must parse");
     require(format->header.id == 0xbeef, "FORMERR must preserve an available transaction ID");
     require(format->header.opcode == 5, "FORMERR must preserve an available opcode");
-    require(format->header.recursion_desired && format->header.checking_disabled, "FORMERR must preserve available RD/CD bits");
+    require(format->header.recursion_desired && format->header.checking_disabled && !format->header.authenticated_data,
+            "local FORMERR must preserve available RD/CD bits but clear AD");
     require(format->header.response_code == static_cast<uint8_t>(ResponseCode::FormErr), "malformed input must produce FORMERR");
     require(format->questions.empty(), "FORMERR from an unparsed request must not copy unvalidated bytes as a question");
 
@@ -526,6 +642,31 @@ void test_error_response_writer()
     require(partial_flags_response && partial_flags_response->header.opcode == 5 && partial_flags_response->header.recursion_desired,
             "FORMERR must retain opcode and RD from an available high flags byte");
 
+    auto raw_header = bytes({
+        0xca, 0xfe, 0x11, 0x30, // opcode STATUS, RD, AD, CD
+        0x00, 0x01,             // QDCOUNT
+        0x00, 0x01,             // ANCOUNT
+        0x00, 0x01,             // NSCOUNT
+        0x00, 0x01,             // ARCOUNT
+    });
+    auto header_only_wire = make_header_only_error_response(raw_header, ResponseCode::Refused, true, kDownstreamResponseBudget);
+    require(header_only_wire && header_only_wire->size() == kDnsHeaderSize, "the raw-prefix helper must emit exactly one DNS header");
+    auto header_only = parse_message(*header_only_wire);
+    require(header_only && header_only->header.id == 0xcafe && header_only->header.opcode == static_cast<uint8_t>(Opcode::Status) &&
+                header_only->header.recursion_desired && header_only->header.checking_disabled && !header_only->header.authenticated_data &&
+                header_only->header.response_code == static_cast<uint8_t>(ResponseCode::Refused),
+            "header-only errors must retain ID/opcode/RD/CD and target RCODE while clearing AD");
+    require(header_only->questions.empty() && header_only->answers.empty() && header_only->authorities.empty() && header_only->additionals.empty(),
+            "header-only errors must set all four section counts to zero");
+
+    auto automatic_fallback = make_error_response(*request, ResponseCode::ServFail, true, kDnsHeaderSize);
+    require(automatic_fallback && automatic_fallback->size() == kDnsHeaderSize,
+            "a local error writer must fall back to a complete header when its question does not fit");
+    auto fallback = parse_message(*automatic_fallback);
+    require(fallback && fallback->questions.empty() && fallback->header.response_code == static_cast<uint8_t>(ResponseCode::ServFail) &&
+                fallback->header.checking_disabled && !fallback->header.authenticated_data,
+            "automatic fallback must retain the local error contract without returning a partial question");
+
     auto too_small = make_error_response(*request, ResponseCode::ServFail, true, kDnsHeaderSize - 1);
     require(!too_small && too_small.error().code == WriteErrorCode::MessageTooLarge, "writer capacity failure must return an error without partial output");
 
@@ -541,8 +682,9 @@ void test_address_response_writer()
 {
     auto request = parse_message(mixed_case_a_query());
     require(request.has_value(), "address response fixture must parse");
-    request->header.id                = 0xabcd;
-    request->header.checking_disabled = true;
+    request->header.id                 = 0xabcd;
+    request->header.authenticated_data = true;
+    request->header.checking_disabled  = true;
 
     const std::array first{std::byte{192}, std::byte{0}, std::byte{2}, std::byte{1}};
     const std::array second{std::byte{192}, std::byte{0}, std::byte{2}, std::byte{2}};
@@ -553,8 +695,9 @@ void test_address_response_writer()
     auto response = parse_message(*wire);
     require(response && response->header.id == 0xabcd && response->header.is_response,
             "an address response must use the current client transaction ID and set QR");
-    require(response->header.recursion_desired && response->header.recursion_available && response->header.checking_disabled,
-            "an address response must preserve RD/CD and advertise recursion availability");
+    require(response->header.recursion_desired && response->header.recursion_available && response->header.checking_disabled &&
+                !response->header.authenticated_data,
+            "a local address response must preserve RD/CD, clear AD, and advertise recursion availability");
     require(response->questions == request->questions && response->questions.front().name.to_string() == "WWW.ExAmple.COM",
             "a cache hit must echo the current question spelling instead of an older cached query");
     require(response->answers.size() == 2 && response->answers[0].name == request->questions.front().name &&
@@ -620,12 +763,14 @@ int main()
     test_header_and_big_endian_fields();
     test_domain_name_model();
     test_query_parse_write_roundtrip();
+    test_classic_udp_serialization_limits();
     test_transaction_id_rewrite();
     test_upstream_response_validation();
     test_compression_and_resource_records();
     test_compression_failures();
     test_truncation_counts_and_limits();
     test_mvp_policy_validation();
+    test_additional_and_opt_policy();
     test_error_response_writer();
     test_address_response_writer();
     test_deterministic_robustness_corpus();

@@ -1,7 +1,9 @@
 #include "DNS.h"
+#include "protocol/DnsLimits.h"
 #include "protocol/DnsParser.h"
 #include "protocol/DnsWriter.h"
 #include "runtime/UniqueFd.h"
+#include "tests/SocketTestSupport.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,22 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+namespace dns::server
+{
+
+struct WorkerLoopTestPeer
+{
+    static void send_response(WorkerLoop                  &worker,
+                              const std::vector<std::byte> &response,
+                              const sockaddr              *client_address,
+                              socklen_t                     client_length) noexcept
+    {
+        worker.send_response(response, client_address, client_length);
+    }
+};
+
+} // namespace dns::server
 
 namespace
 {
@@ -85,6 +103,30 @@ std::vector<std::byte> make_query(uint16_t id, dns::protocol::RecordType type, s
     auto wire = dns::protocol::serialize_query(header, questions);
     require(wire.has_value(), "query fixture must serialize");
     return std::move(*wire);
+}
+
+std::vector<std::byte> make_exact_size_opt_query(uint16_t id, size_t target_size)
+{
+    auto wire = make_query(id, dns::protocol::RecordType::A);
+    constexpr size_t opt_envelope_size = 11;
+    require(wire.size() + opt_envelope_size <= target_size, "OPT boundary fixture must have room for its RR envelope");
+
+    const size_t rdata_size = target_size - wire.size() - opt_envelope_size;
+    require(rdata_size <= 65'535, "OPT boundary fixture RDATA must fit RDLENGTH");
+    wire[10] = std::byte{0};
+    wire[11] = std::byte{1};
+    wire.push_back(std::byte{0});    // root owner
+    wire.push_back(std::byte{0});
+    wire.push_back(std::byte{0x29}); // OPT
+    wire.push_back(std::byte{0x02});
+    wire.push_back(std::byte{0});    // advertised UDP payload size 512
+    wire.insert(wire.end(), 4, std::byte{0});
+    wire.push_back(static_cast<std::byte>((rdata_size >> 8U) & 0xffU));
+    wire.push_back(static_cast<std::byte>(rdata_size & 0xffU));
+    wire.insert(wire.end(), rdata_size, std::byte{0x5a});
+    require(wire.size() == target_size && dns::protocol::parse_message(wire).has_value(),
+            "OPT boundary fixture must remain an envelope-valid DNS query");
+    return wire;
 }
 
 std::vector<std::byte> make_a_rrset_response(std::span<const std::byte> query)
@@ -218,19 +260,11 @@ void send_upstream_response(BlackholeUpstream &upstream, const ForwardedQuery &q
 void test_owned_datagrams_survive_initial_suspend()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "owned datagram socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "owned-datagram upstream fixture must initialize after the suite capability probe");
 
     Cache::DNS_Cache cache{8, 1};
     auto             worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0), blackhole_config(upstream->port));
-    if (!worker_result)
-    {
-        std::cout << "owned datagram socket test skipped by sandbox\n";
-        return;
-    }
+    require(worker_result.has_value(), "owned-datagram worker fixture must initialize after the suite capability probe");
     auto worker = std::move(*worker_result);
 
     dns::runtime::UniqueFd first_client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
@@ -293,11 +327,7 @@ void test_owned_datagrams_survive_initial_suspend()
 void test_udp_reactor_responses()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "reactor socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "reactor upstream fixture must initialize after the suite capability probe");
 
     DNS       service;
     DNSConfig config;
@@ -308,13 +338,7 @@ void test_udp_reactor_responses()
     config.upstream       = blackhole_config(upstream->port);
     require(service.init(config), "reactor service fixture must initialize");
 
-    if (!service.start())
-    {
-        // Restricted sandboxes can deny socket(2); the same executable is run
-        // with local-socket permission during verification.
-        std::cout << "reactor socket test skipped by sandbox\n";
-        return;
-    }
+    require(service.start(), "reactor service fixture must start after the suite capability probe");
 
     const auto port = service.bound_port();
     require(port && *port != 0, "port-zero binding must publish the assigned local port");
@@ -341,6 +365,18 @@ void test_udp_reactor_responses()
     require(mx_response && mx_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NotImp),
             "unsupported QTYPE must receive NOTIMP");
 
+    for (const size_t query_size : {size_t{511}, dns::protocol::kClassicDnsUdpPayloadLimit})
+    {
+        const uint16_t id = query_size == 511 ? uint16_t{0x2501} : uint16_t{0x2502};
+        auto opt_response_wire = exchange(client.get(), *port, make_exact_size_opt_query(id, query_size), "classic UDP OPT boundary query");
+        auto opt_response      = dns::protocol::parse_message(opt_response_wire);
+        require(opt_response && opt_response->header.id == id &&
+                    opt_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NotImp) &&
+                    opt_response->questions.size() == 1 && opt_response->answers.empty() && opt_response->authorities.empty() &&
+                    opt_response->additionals.empty(),
+                "an envelope-valid OPT query at 511/512 bytes must receive NOTIMP on its first response");
+    }
+
     const std::array malformed{std::byte{0x34}, std::byte{0x56}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
                                std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
     auto             malformed_response_wire = exchange(client.get(), *port, malformed, "malformed query");
@@ -348,6 +384,17 @@ void test_udp_reactor_responses()
     require(malformed_response && malformed_response->header.id == 0x3456 &&
                 malformed_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::FormErr),
             "truncated query sections must receive header-only FORMERR");
+
+    auto oversized_query = make_query(0x4567, dns::protocol::RecordType::A);
+    oversized_query.resize(dns::protocol::kDownstreamReceiveBufferSize + 1, std::byte{0});
+    auto oversized_query_response_wire = exchange(client.get(), *port, oversized_query, "oversized query");
+    auto oversized_query_response      = dns::protocol::parse_message(oversized_query_response_wire);
+    require(oversized_query_response && oversized_query_response_wire.size() == dns::protocol::kDnsHeaderSize &&
+                oversized_query_response->header.id == 0x4567 &&
+                oversized_query_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::FormErr) &&
+                oversized_query_response->questions.empty() && oversized_query_response->answers.empty() &&
+                oversized_query_response->authorities.empty() && oversized_query_response->additionals.empty(),
+            "a 513-byte downstream query must receive only a header-only FORMERR");
 
     const std::array response_packet{std::byte{0x56}, std::byte{0x78}, std::byte{0x80}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
                                      std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
@@ -358,10 +405,15 @@ void test_udp_reactor_responses()
     require(::sendto(client.get(), response_packet.data(), response_packet.size(), 0, reinterpret_cast<const sockaddr *>(&server), sizeof(server)) ==
                 static_cast<ssize_t>(response_packet.size()),
             "response-loop fixture must be sent");
+    std::vector<std::byte> oversized_response(dns::protocol::kDownstreamReceiveBufferSize + 1, std::byte{0});
+    std::copy(response_packet.begin(), response_packet.end(), oversized_response.begin());
+    require(::sendto(client.get(), oversized_response.data(), oversized_response.size(), 0, reinterpret_cast<const sockaddr *>(&server),
+                     sizeof(server)) == static_cast<ssize_t>(oversized_response.size()),
+            "oversized response-loop fixture must be sent");
     std::array<std::byte, 64> no_response{};
     errno = 0;
     require(::recvfrom(client.get(), no_response.data(), no_response.size(), 0, nullptr, nullptr) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
-            "the reactor must silently drop QR=1 packets instead of creating a response loop");
+            "the reactor must silently drop both ordinary and oversized QR=1 packets instead of creating a response loop");
 
     service.request_stop();
     service.join();
@@ -371,11 +423,7 @@ void test_udp_reactor_responses()
 void test_upstream_response_is_forwarded()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "upstream forwarding socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "forwarding upstream fixture must initialize after the suite capability probe");
 
     Cache::DNS_Cache cache{8, 1};
     auto             upstream_config = blackhole_config(upstream->port);
@@ -406,7 +454,8 @@ void test_upstream_response_is_forwarded()
     require(parsed_forwarded && !parsed_forwarded->header.is_response && parsed_forwarded->questions.size() == 1,
             "the upstream request must remain a valid one-question DNS query");
 
-    const auto upstream_response = make_a_response(forwarded_query);
+    auto upstream_response = make_a_response(forwarded_query);
+    upstream_response[3] |= std::byte{0x30}; // upstream AD + CD
     require(::sendto(upstream->socket.get(), upstream_response.data(), upstream_response.size(), 0,
                      reinterpret_cast<const sockaddr *>(&worker_address), worker_address_length) == static_cast<ssize_t>(upstream_response.size()),
             "the fake upstream must return its complete DNS response");
@@ -414,8 +463,9 @@ void test_upstream_response_is_forwarded()
     auto client_wire = receive_response(client.get(), "forwarding client");
     auto response    = dns::protocol::parse_message(client_wire);
     require(response && response->header.id == 0xbeef && response->header.is_response &&
-                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError),
-            "the worker must restore the client transaction ID and forward the upstream result");
+                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) &&
+                response->header.authenticated_data && response->header.checking_disabled,
+            "the worker must restore the client transaction ID and transparently forward upstream AD/CD flags");
     require(response->answers.size() == 1 &&
                 response->answers.front().rdata == std::vector<std::byte>{std::byte{203}, std::byte{0}, std::byte{113}, std::byte{7}},
             "the forwarded response must preserve the upstream answer bytes");
@@ -427,14 +477,192 @@ void test_upstream_response_is_forwarded()
             "the forwarding path must report one successful upstream round trip");
 }
 
+void test_oversized_upstream_response_keeps_waiter_pending()
+{
+    auto upstream = make_blackhole_upstream();
+    require(upstream.has_value(), "oversized-upstream fixture must initialize after the suite capability probe");
+
+    Cache::DNS_Cache cache{8, 1};
+    auto             upstream_config = blackhole_config(upstream->port);
+    upstream_config.query_timeout    = std::chrono::milliseconds{100};
+    upstream_config.id_reuse_guard   = std::chrono::milliseconds{100};
+    auto worker_result               = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    require(worker_result.has_value(), "oversized-upstream worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "oversized-upstream client fixture must be created");
+    timeval timeout{1, 0};
+    require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+            "oversized-upstream client receive timeout must be configured");
+
+    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+
+    send_query(client.get(), worker->bound_port(), make_query(0x5101, dns::protocol::RecordType::A, "oversized.example"));
+    auto first_forwarded = receive_forwarded_query(*upstream, "oversized response followed by a valid response");
+    auto valid_response  = make_a_response(first_forwarded.packet);
+    auto oversized_response = valid_response;
+    oversized_response.resize(dns::protocol::kUpstreamReceiveBufferSize + 1, std::byte{0});
+    send_upstream_response(*upstream, first_forwarded, oversized_response);
+    send_upstream_response(*upstream, first_forwarded, valid_response);
+
+    auto first_wire = receive_response(client.get(), "valid response after oversized upstream response");
+    auto first      = dns::protocol::parse_message(first_wire);
+    require(first && first->header.id == 0x5101 &&
+                first->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && first->answers.size() == 1,
+            "an oversized upstream datagram must not complete or remove the pending waiter before a later valid response");
+
+    send_query(client.get(), worker->bound_port(), make_query(0x5102, dns::protocol::RecordType::A, "timeout.example"));
+    auto second_forwarded = receive_forwarded_query(*upstream, "oversized response followed by timeout");
+    auto second_oversized = make_a_response(second_forwarded.packet);
+    second_oversized.resize(dns::protocol::kUpstreamReceiveBufferSize + 1, std::byte{0});
+    send_upstream_response(*upstream, second_forwarded, second_oversized);
+
+    auto timeout_wire = receive_response(client.get(), "timeout after oversized upstream response");
+    auto timed_out    = dns::protocol::parse_message(timeout_wire);
+    require(timed_out && timed_out->header.id == 0x5102 &&
+                timed_out->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::ServFail),
+            "an oversized upstream datagram must leave the waiter pending until its normal timeout produces SERVFAIL");
+
+    worker->request_stop();
+    worker_thread.join();
+    require(worker->stats().upstream_queries == 2 && worker->stats().upstream_invalid_responses == 2 &&
+                worker->stats().upstream_responses == 1 && worker->stats().upstream_timeouts == 1 && worker->stats().responses_sent == 2,
+            "oversized upstream datagrams must be counted invalid without completing either pending waiter");
+}
+
+void test_truncated_upstream_response_is_transparent_and_not_cached()
+{
+    auto upstream = make_blackhole_upstream();
+    require(upstream.has_value(), "TC-response fixture must initialize after the suite capability probe");
+
+    Cache::DNS_Cache cache{8, 1};
+    auto             upstream_config = blackhole_config(upstream->port);
+    upstream_config.query_timeout    = std::chrono::milliseconds{500};
+    upstream_config.id_reuse_guard   = std::chrono::milliseconds{500};
+    auto worker_result               = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    require(worker_result.has_value(), "TC-response worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "TC-response client fixture must be created");
+    timeval timeout{1, 0};
+    require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+            "TC-response client receive timeout must be configured");
+
+    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    for (uint16_t id : {uint16_t{0x5201}, uint16_t{0x5202}})
+    {
+        send_query(client.get(), worker->bound_port(), make_query(id, dns::protocol::RecordType::A, "truncated.example"));
+        auto forwarded = receive_forwarded_query(*upstream, "TC=1 response must not populate the cache");
+        auto response  = make_a_response(forwarded.packet);
+        response[2] |= std::byte{0x02};
+        send_upstream_response(*upstream, forwarded, response);
+
+        auto client_wire = receive_response(client.get(), "transparent TC=1 response");
+        auto parsed      = dns::protocol::parse_message(client_wire);
+        require(parsed && parsed->header.id == id && parsed->header.truncated && parsed->answers.size() == 1,
+                "a valid classic UDP upstream response with TC=1 must be forwarded unchanged without TCP fallback");
+    }
+
+    worker->request_stop();
+    worker_thread.join();
+    require(worker->stats().cache_hits == 0 && worker->stats().cache_misses == 2 && worker->stats().cache_inserts == 0 &&
+                worker->stats().upstream_queries == 2 && worker->stats().upstream_responses == 2 && worker->stats().responses_sent == 2,
+            "a TC=1 response must not populate the positive cache, so the next query reaches upstream again");
+}
+
+void test_cache_reconstruction_overflow_becomes_one_upstream_miss()
+{
+    auto upstream = make_blackhole_upstream();
+    require(upstream.has_value(), "cache-overflow fixture must initialize after the suite capability probe");
+
+    Cache::DNS_Cache cache{8, 1};
+    auto             name = dns::protocol::DomainName::from_text("overflow.example");
+    require(name.has_value(), "cache-overflow name fixture must be valid");
+    std::vector<Cache::IPAddress> addresses;
+    addresses.reserve(40);
+    for (size_t index = 0; index < 40; ++index)
+        addresses.push_back(Cache::IPAddress::v4({192, 0, 2, static_cast<uint8_t>(index + 1)}));
+    cache.shard(0).put(Cache::CacheKey{*name, static_cast<uint16_t>(dns::protocol::RecordType::A),
+                                       static_cast<uint16_t>(dns::protocol::RecordClass::IN)},
+                       std::move(addresses), 60, Cache::Clock::now());
+
+    auto upstream_config            = blackhole_config(upstream->port);
+    upstream_config.query_timeout   = std::chrono::milliseconds{500};
+    upstream_config.id_reuse_guard  = std::chrono::milliseconds{500};
+    auto worker_result              = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    require(worker_result.has_value(), "cache-overflow worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "cache-overflow client fixture must be created");
+    timeval timeout{1, 0};
+    require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+            "cache-overflow client receive timeout must be configured");
+
+    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    send_query(client.get(), worker->bound_port(), make_query(0x5301, dns::protocol::RecordType::A, "overflow.example"));
+    auto forwarded = receive_forwarded_query(*upstream, "cache reconstruction larger than 512 bytes");
+
+    std::array<std::byte, 1> unexpected{};
+    errno = 0;
+    require(::recvfrom(client.get(), unexpected.data(), unexpected.size(), MSG_DONTWAIT, nullptr, nullptr) == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK),
+            "an oversized cache reconstruction must not send a partial downstream response before forwarding upstream");
+
+    auto upstream_response = make_a_response(forwarded.packet);
+    send_upstream_response(*upstream, forwarded, upstream_response);
+    auto client_wire = receive_response(client.get(), "cache reconstruction fallback response");
+    auto response    = dns::protocol::parse_message(client_wire);
+    require(response && response->header.id == 0x5301 && response->answers.size() == 1,
+            "a cache reconstruction overflow must transparently return the single upstream response");
+
+    worker->request_stop();
+    worker_thread.join();
+    require(worker->stats().cache_hits == 0 && worker->stats().cache_misses == 1 && worker->stats().upstream_queries == 1 &&
+                worker->stats().upstream_responses == 1 && worker->stats().responses_sent == 1 && worker->stats().oversized_responses == 0,
+            "an unusable cache entry must become exactly one upstream miss without reaching the final send guard");
+}
+
+void test_send_response_rejects_oversized_payload()
+{
+    auto upstream = make_blackhole_upstream();
+    require(upstream.has_value(), "send-guard fixture must initialize after the suite capability probe");
+
+    Cache::DNS_Cache cache{1, 1};
+    auto worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0), blackhole_config(upstream->port));
+    require(worker_result.has_value(), "send-guard worker fixture must initialize");
+    auto worker = std::move(*worker_result);
+
+    dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
+    require(static_cast<bool>(client), "send-guard client fixture must be created");
+    sockaddr_in client_address{};
+    client_address.sin_family      = AF_INET;
+    client_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    client_address.sin_port        = 0;
+    require(::bind(client.get(), reinterpret_cast<const sockaddr *>(&client_address), sizeof(client_address)) == 0,
+            "send-guard client fixture must bind");
+    socklen_t client_length = sizeof(client_address);
+    require(::getsockname(client.get(), reinterpret_cast<sockaddr *>(&client_address), &client_length) == 0,
+            "send-guard client fixture must expose its address");
+
+    std::vector<std::byte> oversized(dns::protocol::kDownstreamResponseBudget + 1, std::byte{0});
+    dns::server::WorkerLoopTestPeer::send_response(*worker, oversized, reinterpret_cast<const sockaddr *>(&client_address), client_length);
+
+    std::array<std::byte, 1> unexpected{};
+    errno = 0;
+    require(::recvfrom(client.get(), unexpected.data(), unexpected.size(), 0, nullptr, nullptr) == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK),
+            "the final send guard must not emit a UDP datagram larger than the downstream response budget");
+    require(worker->stats().oversized_responses == 1 && worker->stats().responses_sent == 0 && worker->stats().send_errors == 0,
+            "the final send guard must diagnose an oversized response without treating it as a sendto failure");
+}
+
 void test_positive_rrsets_are_cached_without_upstream_requery()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "positive cache socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "positive-cache upstream fixture must initialize after the suite capability probe");
 
     Cache::DNS_Cache cache{8, 1};
     auto             upstream_config = blackhole_config(upstream->port);
@@ -515,11 +743,7 @@ void test_positive_rrsets_are_cached_without_upstream_requery()
 void test_filter_snapshot_precedes_an_existing_cache_entry()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "filter pipeline socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "filter-pipeline upstream fixture must initialize after the suite capability probe");
 
     DNS       service;
     DNSConfig config;
@@ -529,11 +753,7 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
     config.port           = 0;
     config.upstream       = blackhole_config(upstream->port);
     require(service.init(config), "runtime-filter service fixture must initialize");
-    if (!service.start())
-    {
-        std::cout << "filter pipeline socket test skipped by sandbox\n";
-        return;
-    }
+    require(service.start(), "runtime-filter service fixture must start after the suite capability probe");
 
     auto ready_update = service.replace_blocked_domains({});
     require(ready_update && ready_update->generation == 2 && ready_update->rule_count == 0,
@@ -610,11 +830,7 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
 void test_configured_filter_snapshot_reaches_dns_workers()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "configured filter socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "configured-filter upstream fixture must initialize after the suite capability probe");
 
     DNS       service;
     DNSConfig config;
@@ -625,11 +841,7 @@ void test_configured_filter_snapshot_reaches_dns_workers()
     config.blocked_domains = {"blocked.example"};
     config.upstream        = blackhole_config(upstream->port);
     require(service.init(config), "configured filter service fixture must initialize");
-    if (!service.start())
-    {
-        std::cout << "configured filter socket test skipped by sandbox\n";
-        return;
-    }
+    require(service.start(), "configured-filter service fixture must start after the suite capability probe");
 
     const auto port = service.bound_port();
     require(port.has_value(), "configured filter service must publish its bound port");
@@ -660,11 +872,7 @@ void test_configured_filter_snapshot_reaches_dns_workers()
 void test_shutdown_cancels_pending_upstream_query()
 {
     auto upstream = make_blackhole_upstream();
-    if (!upstream)
-    {
-        std::cout << "pending shutdown socket test skipped by sandbox\n";
-        return;
-    }
+    require(upstream.has_value(), "pending-shutdown upstream fixture must initialize after the suite capability probe");
 
     Cache::DNS_Cache cache{8, 1};
     auto             upstream_config = blackhole_config(upstream->port);
@@ -704,10 +912,18 @@ void test_truncated_datagram_decision()
 
 int main()
 {
+    const auto socket_capability = dns::test::probe_ipv4_loopback_datagram_io();
+    if (!socket_capability.available)
+        return dns::test::socket_test_unavailable_exit(socket_capability, "reactor tests");
+
     test_truncated_datagram_decision();
     test_owned_datagrams_survive_initial_suspend();
     test_udp_reactor_responses();
     test_upstream_response_is_forwarded();
+    test_oversized_upstream_response_keeps_waiter_pending();
+    test_truncated_upstream_response_is_transparent_and_not_cached();
+    test_cache_reconstruction_overflow_becomes_one_upstream_miss();
+    test_send_response_rejects_oversized_payload();
     test_positive_rrsets_are_cached_without_upstream_requery();
     test_filter_snapshot_precedes_an_existing_cache_entry();
     test_configured_filter_snapshot_reaches_dns_workers();

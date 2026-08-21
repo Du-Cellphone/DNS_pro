@@ -1,6 +1,7 @@
 #include "WorkerLoop.h"
 
 #include "CachePolicy.h"
+#include "protocol/DnsLimits.h"
 #include "protocol/DnsParser.h"
 #include "protocol/DnsQuery.h"
 #include "protocol/DnsWriter.h"
@@ -66,16 +67,24 @@ bool is_valid_upstream_config(const UpstreamConfig &config) noexcept
 
 DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet, bool truncated)
 {
-    if (truncated)
+    if (truncated || packet.size() > protocol::kDownstreamReceiveBufferSize)
     {
-        auto format_error = protocol::make_format_error_response(packet);
+        // MSG_TRUNC gives us the original datagram length while the span only
+        // exposes the safely received prefix. Do not parse that partial DNS
+        // message. A response prefix must be dropped to avoid response loops;
+        // a query prefix with a usable ID/QR bit gets a header-only FORMERR.
+        if (packet.size() < 3 || (std::to_integer<uint8_t>(packet[2]) & 0x80U) != 0)
+            return DatagramDecision{DatagramOutcome::Dropped, {}, std::nullopt};
+
+        auto format_error = protocol::make_header_only_error_response(
+            packet, protocol::ResponseCode::FormErr, true, protocol::kDownstreamResponseBudget);
         return DatagramDecision{DatagramOutcome::Truncated, format_error ? std::move(*format_error) : std::vector<std::byte>{}, std::nullopt};
     }
 
     auto parsed = protocol::parse_message(packet);
     if (!parsed)
     {
-        auto format_error = protocol::make_format_error_response(packet);
+        auto format_error = protocol::make_format_error_response(packet, true, protocol::kDownstreamResponseBudget);
         return DatagramDecision{DatagramOutcome::Malformed, format_error ? std::move(*format_error) : std::vector<std::byte>{}, std::nullopt};
     }
 
@@ -85,7 +94,8 @@ DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet
         if (query.error().code == protocol::QueryErrorCode::NotAQuery)
             return DatagramDecision{DatagramOutcome::Dropped, {}, std::nullopt};
 
-        auto response = protocol::make_error_response(*parsed, protocol::response_code_for(query.error().code), true, kMaximumDatagramSize);
+        auto response =
+            protocol::make_error_response(*parsed, protocol::response_code_for(query.error().code), true, protocol::kDownstreamResponseBudget);
         if (!response)
             return DatagramDecision{DatagramOutcome::InternalError, {}, std::nullopt};
         return DatagramDecision{DatagramOutcome::Unsupported, std::move(*response), std::nullopt};
@@ -363,7 +373,7 @@ void WorkerLoop::drain_wakeup() const noexcept
 
 void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
 {
-    std::array<std::byte, kMaximumDatagramSize> buffer{};
+    std::array<std::byte, protocol::kDownstreamReceiveBufferSize> buffer{};
     size_t                                      datagrams = 0;
 
     while (!stop_token.stop_requested() && datagrams < kReceiveBudget)
@@ -463,7 +473,8 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                 if (snapshot && snapshot->blocklist.matches(question.name))
                 {
                     ++stats_.blocked_queries;
-                    auto refused = protocol::make_error_response(*decision.request, protocol::ResponseCode::Refused, true, kMaximumDatagramSize);
+                    auto refused = protocol::make_error_response(
+                        *decision.request, protocol::ResponseCode::Refused, true, protocol::kDownstreamResponseBudget);
                     if (!refused)
                     {
                         ++stats_.internal_errors;
@@ -484,14 +495,25 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                     auto cache_hit = cache_shard_.get(*cache_key, Cache::Clock::now());
                     if (cache_hit)
                     {
-                        ++stats_.cache_hits;
-                        auto response = make_cache_hit_response(*decision.request, *cache_hit, kMaximumDatagramSize);
-                        if (!response)
+                        auto response = make_cache_hit_response(*decision.request, *cache_hit, protocol::kDownstreamResponseBudget);
+                        if (response)
+                        {
+                            ++stats_.cache_hits;
+                            decision.response = std::move(*response);
+                        }
+                        else if (response.error().code == protocol::WriteErrorCode::MessageTooLarge)
+                        {
+                            // A compressed upstream RRset can fit in 512 bytes
+                            // even when this cache's canonical reconstruction
+                            // cannot. Treat the entry as a miss and forward the
+                            // original request exactly once.
+                            ++stats_.cache_misses;
+                        }
+                        else
                         {
                             ++stats_.internal_errors;
                             co_return;
                         }
-                        decision.response = std::move(*response);
                     }
                     else
                     {
@@ -519,9 +541,15 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                                     auto cacheable = cacheable_address_set(*parsed_response, question);
                                     if (cacheable)
                                     {
-                                        cache_shard_.put(std::move(*cache_key), std::move(cacheable->addresses), cacheable->ttl,
-                                                         Cache::Clock::now());
-                                        ++stats_.cache_inserts;
+                                        Cache::CacheHit candidate{std::move(cacheable->addresses), cacheable->ttl};
+                                        auto cache_wire = make_cache_hit_response(
+                                            *decision.request, candidate, protocol::kDownstreamResponseBudget);
+                                        if (cache_wire)
+                                        {
+                                            cache_shard_.put(std::move(*cache_key), std::move(candidate.addresses), candidate.remaining_ttl,
+                                                             Cache::Clock::now());
+                                            ++stats_.cache_inserts;
+                                        }
                                     }
                                 }
                             }
@@ -536,7 +564,8 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
             }
             if (decision.response.empty())
             {
-                auto servfail = protocol::make_error_response(*decision.request, protocol::ResponseCode::ServFail, true, kMaximumDatagramSize);
+                auto servfail = protocol::make_error_response(
+                    *decision.request, protocol::ResponseCode::ServFail, true, protocol::kDownstreamResponseBudget);
                 if (!servfail)
                 {
                     ++stats_.internal_errors;
@@ -562,6 +591,13 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
 
 void WorkerLoop::send_response(const std::vector<std::byte> &response, const sockaddr *client_address, socklen_t client_length) noexcept
 {
+    if (response.size() > protocol::kDownstreamResponseBudget)
+    {
+        ++stats_.oversized_responses;
+        std::cerr << "worker " << worker_id_ << " refused to send an oversized downstream response (" << response.size() << " bytes)\n";
+        return;
+    }
+
     ssize_t sent;
     do
     {

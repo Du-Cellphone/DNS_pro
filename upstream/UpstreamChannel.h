@@ -1,5 +1,6 @@
 #pragma once
 
+#include "protocol/DnsLimits.h"
 #include "protocol/DnsMessage.h"
 #include "runtime/Scheduler.h"
 #include "runtime/TimerQueue.h"
@@ -151,7 +152,9 @@ public:
     using TimePoint = runtime::TimerQueue::TimePoint;
     using Duration  = runtime::TimerQueue::Duration;
 
-    static constexpr size_t kMaximumPacketSize  = 4096;
+    // Retained as a source-compatible alias for tests and callers that use a
+    // receive buffer sized to the channel's classic UDP service boundary.
+    static constexpr size_t kMaximumPacketSize  = protocol::kUpstreamReceiveBufferSize;
     static constexpr size_t kTransactionIdSpace = 65'536;
 
     UpstreamChannel() = default;

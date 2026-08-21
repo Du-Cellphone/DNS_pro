@@ -12,9 +12,13 @@ DNS_PRO 第一版是运行在 Linux 上的过滤型 DNS 转发器，不是权威
 
 - 下游客户端通过 UDP 查询。
 - 通过 UDP 向一个可配置的上游 DNS 服务器转发查询。
+- 下游查询、上游查询和下游/上游响应都遵守经典 UDP DNS 的 512 字节 payload 上限；该限制属于服务传输策略，不是通用 DNS wire parser 的全局上限。
 - 支持 `A` 和 `AAAA` 查询的解析、过滤、转发及正缓存。
 - 无法解析但至少包含 transaction ID 的查询报文返回 `FORMERR`；更短的报文直接丢弃。
 - 格式合法但 MVP 不支持的 opcode、QTYPE、QCLASS 或扩展返回 `NOTIMP`。
+- 所有本地响应都受 512 字节预算约束；错误响应无法连同 question 装入预算时退化为保留 ID、opcode、RD、CD 和目标 RCODE 的 header-only 响应，所有 section count 为零且 `AD=0`。最终发送入口再次拒绝任何 oversized 响应。
+- 下游收到大于 512 字节的查询时，只读取固定头部前缀并返回 header-only `FORMERR`；大于 512 字节且 `QR=1` 的数据报静默丢弃。被截断的部分报文不得进入完整 parser。
+- 上游收到大于 512 字节的响应时丢弃该数据报，但保持原 pending query 继续等待；若没有后续合法响应，再按原 deadline 超时并返回 `SERVFAIL`。
 - 上游超时或网络失败返回 `SERVFAIL`。
 - 命中过滤规则时返回 `REFUSED`，并保留客户端 transaction ID 和原始 question。
 - 服务支持显式启动、停止和等待退出；停止时取消尚未完成的上游查询。
@@ -61,8 +65,11 @@ canonical QNAME + QTYPE + QCLASS
 - 地址缓存以完整的直接 `A`/`AAAA` RRset 为值，并以 RRset 中最小 TTL 作为统一缓存期限；不会只截取多地址响应中的第一条记录。
 - 第一版不会把 `CNAME` 链改写为直接地址答案。包含别名链或无法由地址 RRset 无损重建的 authority/additional 数据时，响应仍透明转发，但不进入缓存。
 - 带 `CD` 或 `AD` DNSSEC 控制位的查询透明转发但绕过地址缓存，避免与普通查询共享未经验证或验证语义不同的结果。
+- 下游查询的 `AD`/`CD` 原样转发，上游响应的 `AD`/`CD` 原样返回。本地产生的 error/cache response 不设置 `AD`，但按 writer 契约保留 query 的 `CD`。
+- 合法但设置 `TC=1` 的上游响应透明返回且不进入正缓存；第一版不尝试 TCP fallback。
 - 缓存采用上游响应中的实际 TTL，并使用单调时钟判断过期。
 - 返回缓存响应时必须恢复当前客户端的 transaction ID，并反映剩余 TTL。
+- 缓存 RRset 若无法在 512 字节内无损重建，则该次访问按 cache miss 处理并只向上游发送一次查询，不能发送半截缓存响应。
 - 第一版不实现 `NXDOMAIN`、NODATA 等负缓存。
 - 过滤检查先于缓存查询，规则更新后不能因为旧缓存而绕过过滤。
 
@@ -80,7 +87,7 @@ canonical QNAME + QTYPE + QCLASS
 
 - 下游或上游 DNS over TCP。
 - UDP 响应截断后的 TCP fallback。
-- EDNS0 的完整协商与所有扩展选项。
+- 任何 EDNS/OPT 协商或扩展选项。DNS RR 外壳完整的 OPT/additional query 返回 `NOTIMP`；RR 外壳截断、RDLENGTH 越界或 section/trailing 不一致返回 `FORMERR`，OPT RDATA 内部 option tuple 保持 opaque。
 - 多上游负载均衡、健康检查和自动故障转移。
 - DNSSEC 验证。
 - DoT、DoH、DoQ。
@@ -96,7 +103,7 @@ canonical QNAME + QTYPE + QCLASS
 
 1. 全新构建目录能够完成配置、编译和 CTest。
 2. DNS parser 对截断、越界和恶意 compression pointer 输入保持内存安全。
-3. `dig` 可以通过 DNS_PRO 完成未命中过滤规则的 A/AAAA 查询。
+3. `dig +noedns` 可以通过 DNS_PRO 完成未命中过滤规则的 A/AAAA 查询；带合法 OPT 的原始查询首包直接得到 `NOTIMP`，不能依赖客户端 fallback 掩盖行为。
 4. 缓存命中不访问上游，且 A 与 AAAA 不会互相覆盖。
 5. 父域过滤规则能够拦截其子域，命中时返回 `REFUSED`。
 6. 上游响应乱序、重复、迟到或超时时不会串包或重复恢复协程。

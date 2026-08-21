@@ -24,6 +24,8 @@
 namespace dns::server
 {
 
+struct WorkerLoopTestPeer;
+
 struct UpstreamConfig
 {
     // MVP accepts an IPv4 literal to avoid resolving the resolver itself.
@@ -71,6 +73,7 @@ struct WorkerStats
     uint64_t cache_bypasses{0};
     uint64_t cache_inserts{0};
     uint64_t responses_sent{0};
+    uint64_t oversized_responses{0};
     uint64_t send_errors{0};
     uint64_t upstream_queries{0};
     uint64_t upstream_responses{0};
@@ -125,6 +128,8 @@ public:
     [[nodiscard]] const WorkerStats &stats() const noexcept { return stats_; }
 
 private:
+    friend struct WorkerLoopTestPeer;
+
     enum class EventKind : uint64_t
     {
         Listener = 1,
@@ -140,7 +145,6 @@ private:
         bool                   truncated{false};
     };
 
-    static constexpr size_t kMaximumDatagramSize   = 4096;
     static constexpr size_t kReceiveBudget         = 64;
     static constexpr size_t kUpstreamReceiveBudget = 64;
     static constexpr size_t kTimerBudget           = 64;

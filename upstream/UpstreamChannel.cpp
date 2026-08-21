@@ -222,7 +222,7 @@ UpstreamChannel::BeginResult UpstreamChannel::begin(QueryAwaiter &query, runtime
     {
         try
         {
-            return protocol::serialize_query(upstream_header, questions, kMaximumPacketSize);
+            return protocol::serialize_query(upstream_header, questions, protocol::kUpstreamQueryBudget);
         }
         catch (...)
         {
@@ -378,7 +378,7 @@ PacketResult UpstreamChannel::handle_datagram(std::span<const std::byte> packet,
 {
     if (!running_ || !on_owner_thread())
         return PacketResult::InvariantFailure;
-    if (truncated || packet.size() > kMaximumPacketSize)
+    if (truncated || packet.size() > protocol::kUpstreamReceiveBufferSize)
     {
         ++stats_.invalid_responses;
         return PacketResult::Invalid;
@@ -395,7 +395,7 @@ PacketResult UpstreamChannel::handle_datagram(std::span<const std::byte> packet,
     try
     {
         protocol::ParseLimits limits;
-        limits.maximum_packet_size = kMaximumPacketSize;
+        limits.maximum_packet_size = protocol::kUpstreamReceiveBufferSize;
         auto parsed                = protocol::parse_message(packet, limits);
         if (!parsed || !protocol::validate_upstream_response(*parsed, *id, query->header_.opcode, query->question_))
         {
@@ -425,7 +425,7 @@ DrainResult UpstreamChannel::drain(size_t budget) noexcept
     if (!running_ || !on_owner_thread())
         return result;
 
-    std::array<std::byte, kMaximumPacketSize> buffer{};
+    std::array<std::byte, protocol::kUpstreamReceiveBufferSize> buffer{};
     while (result.datagrams < budget)
     {
         iovec  io_vector{buffer.data(), buffer.size()};
@@ -626,7 +626,7 @@ UpstreamChannel::TimePoint UpstreamChannel::guarded_reuse_time(TimePoint now) co
 
 bool UpstreamChannel::discard_socket_input(int socket_fd) noexcept
 {
-    std::array<std::byte, kMaximumPacketSize> buffer{};
+    std::array<std::byte, protocol::kUpstreamReceiveBufferSize> buffer{};
     constexpr size_t                          maximum_discarded_datagrams = kTransactionIdSpace;
     size_t                                    discarded                   = 0;
 

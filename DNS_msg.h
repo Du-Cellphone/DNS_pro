@@ -6,10 +6,11 @@
 // suitable for parsing network data.
 
 #include "protocol/DnsMessage.h"
+#include "protocol/DnsLimits.h"
 
 #include <cstddef>
 
-inline constexpr size_t UDP_MAX = 512;
+inline constexpr size_t UDP_MAX = dns::protocol::kClassicDnsUdpPayloadLimit;
 
 using DNS_Header   = dns::protocol::Header;
 using DNS_Question = dns::protocol::Question;
