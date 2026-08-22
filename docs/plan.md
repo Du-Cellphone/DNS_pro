@@ -2,7 +2,7 @@
 
 本文档从阶段 10 完成后的代码状态出发，统一记录已经确认的产品边界、控制面架构、快照生命周期、worker 恢复语义和后续实施顺序。后续若改变这里的协议或生命周期契约，必须在同一阶段同步修改本文档、`docs/MVP_SCOPE.md` 和对应测试。
 
-当前实施状态：阶段 11 的代码、自动化回归、严格 socket 模式及 ASan/UBSan 验证已经完成，下一阶段为阶段 12。本地环境缺少 `clang++` 和 `dig` 时，libFuzzer target 的实际构建运行及 `dig +noedns` 手工验收须在具备这些工具的 CI/主机补跑；等价的通用 parser/service-boundary target、raw OPT 首包和 A/AAAA UDP 转发回归已经纳入代码库。
+当前实施状态：阶段 12 的真实生命周期、A/C 启动握手、稳定 `WorkerRecord`、双门数据面激活和结构化故障结果已经完成，default、严格 socket、ASan、UBSan 四套构建与全部 11 个 CTest 目标均通过，下一阶段为阶段 13。本地环境仍缺少 `clang++` 和 `dig`，因此 libFuzzer target 的实际构建运行及 `dig +noedns` 手工验收须在具备这些工具的 CI/主机补跑；等价的通用 parser/service-boundary target、raw OPT 首包和 A/AAAA UDP 转发回归已经纳入代码库。
 
 ## 1. 已确认的决策
 
@@ -220,7 +220,7 @@ participant 注册和 publication 通过一个只走低频控制路径的 regist
 3. worker 安装本地快照，并发布 observed generation；
 4. C 在同一协议下重新校验 current generation；
 5. 只有仍与 current 一致时，才接受 Ready；否则先切换到新 generation 再 Ready；
-6. 初始启动的 Ready worker 停在 DNS-owned、带谓词的共享 activation gate，不接收数据报；DNS 提交 `Active`/Running health 后通过 C 打开 gate 并 `notify_all`。replacement 则在 Ready 和代际复检完成后由 C 单独 Activate。
+6. 初始启动采用两段式 gate：Ready worker 先停在 activation gate；C 允许其完成 activation ack 后，worker 再停在 data-plane gate。DNS 只有在所有 ack 完成且 A/C/worker 仍存活时才提交 `Active`/Running health，并在线性化点释放 data-plane gate。replacement 则在 Ready 和代际复检完成后由 C 单独 Activate。
 
 任何已经可能持有旧快照的 Starting participant 都必须被 publication cohort 捕获。commit 以后才注册的新实例直接从最新快照启动，不追加到旧 publication 的 cohort。
 
@@ -348,7 +348,7 @@ Ready | InitError(details)
 RequestedStop | FatalExit(details)
 ```
 
-`Ready` 不是 `run()` 的最终返回值，不能覆盖或代替之后的 exit result。`WorkerLoop::create()` 在创建线程前失败时，C 仍向 start 返回结构化 create error。线程 wrapper 捕获所有异常，并通过每个 `WorkerRecord` 预分配的 ready/completion slot、原子 sequence 和 eventfd/通知机制可靠上报；异常路径不得依赖动态分配。服务级 `join()`/`wait()` 返回结构化 `ServiceExitResult`，使 main 能区分 ExplicitStop、StartupFailure 和 Fatal，而不是在运行期 fatal 后只能猜测退出原因。
+`Ready` 不是 `run()` 的最终返回值，不能覆盖或代替之后的 exit result。`WorkerLoop::create()` 在创建线程前失败时，C 仍向 start 返回结构化 create error。线程 wrapper 捕获所有异常，并通过每个 `WorkerRecord` 预分配的 ready/activation/completion slot 与 mutex/CV 谓词通知可靠上报；异常路径不得依赖动态分配。阶段 13 的 generation 回收进展另行使用单调 progress sequence 和 generation eventfd，不能把它误当成阶段 12 已有的线程结果通道。服务级 `join()`/`wait()` 返回结构化 `ServiceExitResult`，使 main 能区分 ExplicitStop、StartupFailure 和 Fatal，而不是在运行期 fatal 后只能猜测退出原因。
 
 启动顺序为：
 
@@ -357,8 +357,8 @@ RequestedStop | FatalExit(details)
 3. 启动 B、A、C，并等待所需角色 Ready；运行期更新关闭时跳过 A/B；这是阶段 13 完成后的最终形态，阶段 12 尚未引入 B 时只启动 A/C；
 4. C 创建全部 worker instance；Ready 的 worker 停在 activation gate，不开始 `epoll` 数据面处理；
 5. 对 `port=0`，C 先串行创建第一个 listener 并得到本次尝试私有的 `attempt_bound_port`，再让其余 worker 绑定这个确切端口；Starting 期间 `bound_port()` 不把 attempt 值当成已生效端口；
-6. 只有所有必需角色和 worker 都 Ready，DNS 才提交 lifecycle=`Active`、Running health 和 immutable `effective_bound_port` snapshot；
-7. 提交 Active 后，通过 C 把 DNS-owned activation gate 的谓词设为 Open 并可靠 `notify_all`，再开放 update admission；这些发布均完成且 start 重新确认 attempt 未被 stop/fatal 取代后，`start()` 才返回成功。任一 gate 在提交前收到 stop/cancel 都直接退出，不能处理请求。
+6. 全部 Ready 后，C 打开第一道 activation gate；worker 完成 activation ack 后停在第二道 data-plane gate，服务仍保持 `Starting`；
+7. DNS 在同一提交协议中复检 A/C 和全部当前 worker instance 仍存活，提交 lifecycle=`Active`、Running health、immutable `effective_bound_port` snapshot，释放 data-plane gate 并开放 update admission；完成后 `start()` 才返回成功。任一角色在提交前退出，或任一 gate 收到 stop/cancel，都进入事务式回滚且不能处理请求。
 
 任一环节失败都进行相同的事务式回滚：停止并 join 已创建 worker，释放其本地快照，停止并 join C/A/B，并丢弃未正式发布的 `attempt_bound_port`。回滚后的终态由 first-wins 决定：StartupFailure 先赢则进入 Failed；若 explicit cancel/stop 已先赢则进入 Stopped。初始 worker 失败永不触发 restart policy。
 
@@ -492,7 +492,7 @@ emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退
 - 实现稳定地址的 `WorkerRecord`/最小 `WorkerEpoch`，移除 WorkerLoop 中重复的持久状态；
 - `WorkerLoop::create/run` 返回结构化结果，completion channel 预分配且异常安全；
 - C 负责 worker ready/result/join；A/C 以及所有控制角色共用 top-level exception boundary 和独立 fatal-stop 闭环，阶段 13 新增的 B 必须接入同一机制；
-- 启动 all-or-nothing，加入 activation gate，覆盖线程创建部分失败、部分 Ready 和 Starting/stop 竞态；update admission 只在 Active 后开放；
+- 启动 all-or-nothing，加入 activation/data-plane 双门握手，覆盖线程创建部分失败、部分 Ready、提交前 completion 和 Starting/stop 竞态；update admission 只在 Active 后开放；
 - 明确一次性 init：Stopped/Failed 后必须新建 DNS 对象；
 - 删除 `manager_count` 及旧 init 重载，加入明确的 runtime-update/recovery 配置字段；本阶段 recovery policy 只存配置，不执行 restart；
 - 冻结并发布 `effective_bound_port` health snapshot；

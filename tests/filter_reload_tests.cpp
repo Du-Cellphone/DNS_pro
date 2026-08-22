@@ -64,7 +64,7 @@ void require_error(const FilterUpdateResult &result, FilterUpdateErrorCode code,
 void test_successful_reload_and_failed_reload_rollback()
 {
     FilterUpdateController controller{make_snapshot({"old.example"}, dns::server::kInitialFilterGeneration)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     const auto initial = controller.current_version();
     require(initial && initial->generation == 1 && initial->rule_count == 1, "initial snapshot must be generation one");
@@ -93,7 +93,7 @@ void test_successful_reload_and_failed_reload_rollback()
 void test_concurrent_reloads_are_serialized()
 {
     FilterUpdateController controller{make_snapshot({}, dns::server::kInitialFilterGeneration)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     std::barrier                      start_gate{3};
     std::optional<FilterUpdateResult> first_result;
@@ -163,7 +163,7 @@ void test_builder_execution_is_fifo_and_serial()
     };
 
     FilterUpdateController controller{make_snapshot({}, dns::server::kInitialFilterGeneration), std::move(ordered_builder)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     auto first = controller.submit_replace({"first.fifo"});
     first_entered.acquire();
@@ -178,7 +178,7 @@ void test_builder_execution_is_fifo_and_serial()
     require(first_result && first_result->generation == 2 && second_result && second_result->generation == 3,
             "queued reloads must publish in submission order");
     require(calls.load(std::memory_order_relaxed) == 2 && maximum_active_builders.load(std::memory_order_relaxed) == 1,
-            "the manager must invoke at most one snapshot builder at a time");
+            "the update controller must invoke at most one snapshot builder at a time");
     require(controller.snapshot()->blocklist.matches("second.fifo") && !controller.snapshot()->blocklist.matches("first.fifo"),
             "the final FIFO generation must contain only the second replacement rule set");
 
@@ -199,7 +199,7 @@ void test_close_during_build_cancels_inflight_and_queued_requests()
 
     const auto             initial = make_snapshot({"stable.example"}, dns::server::kInitialFilterGeneration);
     FilterUpdateController controller{initial, std::move(blocking_builder)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     auto inflight = controller.submit_replace({"inflight.example"});
     entered_build.acquire();
@@ -232,7 +232,7 @@ void test_close_during_build_cancels_inflight_and_queued_requests()
 void test_runner_stop_closes_admission()
 {
     FilterUpdateController controller{make_snapshot({}, dns::server::kInitialFilterGeneration)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     runner.request_stop();
     runner.join();
@@ -241,7 +241,7 @@ void test_runner_stop_closes_admission()
     require_error(rejected, FilterUpdateErrorCode::ShuttingDown, "runner exit must atomically close update admission");
 }
 
-void test_builder_exception_does_not_stop_the_manager()
+void test_builder_exception_does_not_stop_the_controller()
 {
     std::atomic<size_t>             calls{0};
     FilterUpdateController::Builder throwing_builder =
@@ -253,15 +253,15 @@ void test_builder_exception_does_not_stop_the_manager()
     };
 
     FilterUpdateController controller{make_snapshot({"stable.example"}, dns::server::kInitialFilterGeneration), std::move(throwing_builder)};
-    std::jthread           runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread           runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     auto failed = await(controller.submit_replace({"throw.example"}), "an injected builder exception must complete");
     require_error(failed, FilterUpdateErrorCode::InternalError, "a builder exception must become an internal update error");
     require(controller.current_version()->generation == 1, "a builder exception must not advance the generation");
 
-    auto recovered = await(controller.submit_replace({"recovered.example"}), "the manager must process work after a builder exception");
+    auto recovered = await(controller.submit_replace({"recovered.example"}), "the update controller must process work after a builder exception");
     require(recovered && recovered->generation == 2 && controller.snapshot()->blocklist.matches("recovered.example"),
-            "the manager must remain usable after a builder exception");
+            "the update controller must remain usable after a builder exception");
 
     stop_controller(controller, runner);
 }
@@ -271,7 +271,7 @@ void test_generation_exhaustion_is_explicit()
     constexpr FilterGeneration maximum = std::numeric_limits<FilterGeneration>::max();
     const auto                 initial = make_snapshot({"maximum.example"}, maximum);
     FilterUpdateController     controller{initial};
-    std::jthread               runner{[&controller](std::stop_token token) { controller.run(token); }};
+    std::jthread               runner{[&controller](std::stop_token token) { static_cast<void>(controller.run(token)); }};
 
     auto exhausted = await(controller.submit_replace({"overflow.example"}), "generation exhaustion must complete");
     require_error(exhausted, FilterUpdateErrorCode::GenerationExhausted, "generation wraparound must be rejected explicitly");
@@ -289,7 +289,7 @@ int main()
     test_builder_execution_is_fifo_and_serial();
     test_close_during_build_cancels_inflight_and_queued_requests();
     test_runner_stop_closes_admission();
-    test_builder_exception_does_not_stop_the_manager();
+    test_builder_exception_does_not_stop_the_controller();
     test_generation_exhaustion_is_explicit();
     std::cout << "all filter reload tests passed\n";
     return EXIT_SUCCESS;

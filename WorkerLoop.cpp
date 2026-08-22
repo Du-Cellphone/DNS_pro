@@ -36,7 +36,7 @@ protocol::WriteResult make_cache_hit_response(const protocol::Message &request, 
     if (request.questions.size() != 1)
         return std::unexpected(protocol::WriteError{protocol::WriteErrorCode::WrongQuestionCount});
 
-    const uint16_t type = request.questions.front().type;
+    const uint16_t                           type = request.questions.front().type;
     std::vector<protocol::AddressAnswerView> answers;
     answers.reserve(hit.addresses.size());
     for (const Cache::IPAddress &address : hit.addresses)
@@ -76,8 +76,8 @@ DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet
         if (packet.size() < 3 || (std::to_integer<uint8_t>(packet[2]) & 0x80U) != 0)
             return DatagramDecision{DatagramOutcome::Dropped, {}, std::nullopt};
 
-        auto format_error = protocol::make_header_only_error_response(
-            packet, protocol::ResponseCode::FormErr, true, protocol::kDownstreamResponseBudget);
+        auto format_error =
+            protocol::make_header_only_error_response(packet, protocol::ResponseCode::FormErr, true, protocol::kDownstreamResponseBudget);
         return DatagramDecision{DatagramOutcome::Truncated, format_error ? std::move(*format_error) : std::vector<std::byte>{}, std::nullopt};
     }
 
@@ -113,11 +113,8 @@ WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cac
     return worker;
 }
 
-WorkerLoop::CreateResult WorkerLoop::create(size_t                  worker_id,
-                                            uint16_t                port,
-                                            Cache::CacheShard      &cache_shard,
-                                            const FilterSnapshotSlot &filter_snapshots,
-                                            const UpstreamConfig   &upstream_config)
+WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard,
+                                            const FilterSnapshotSlot &filter_snapshots, const UpstreamConfig &upstream_config)
 {
     auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, &filter_snapshots}};
     auto initialized = worker->initialize(port, upstream_config);
@@ -209,132 +206,220 @@ std::expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const
     return {};
 }
 
-void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
+WorkerRunResult WorkerLoop::run(std::stop_token thread_stop_token, WorkerRunObserver *observer) noexcept
 {
-    std::array<epoll_event, 64> events{};
-    std::stop_callback          forward_stop{thread_stop_token, [this] { request_stop(); }};
-    const std::stop_token       stop_token = stop_source_.get_token();
+    const auto requested_stop = [] { return WorkerRunResult{WorkerRunOutcome::RequestedStop, std::nullopt}; };
+    const auto fatal_exit     = [](WorkerRuntimeStep step, int error_number = 0)
+    { return WorkerRunResult{WorkerRunOutcome::FatalExit, WorkerRuntimeError{step, error_number}}; };
+    const auto init_error = [](WorkerRuntimeStep step, int error_number = 0)
+    { return WorkerReadyResult{WorkerReadyOutcome::InitError, WorkerRuntimeError{step, error_number}}; };
+
+    const std::stop_token          stop_token = stop_source_.get_token();
+    std::optional<WorkerRunResult> result;
+    bool                           ready_reported{false};
+    bool                           activated{false};
 
     try
     {
+        std::stop_callback          forward_stop{thread_stop_token, [this] { request_stop(); }};
+        std::array<epoll_event, 64> events{};
+
         if (!scheduler_.start(stop_token))
         {
-            ++stats_.internal_errors;
-            std::cerr << "worker " << worker_id_ << " scheduler could not start\n";
-            return;
+            result.emplace(fatal_exit(WorkerRuntimeStep::StartScheduler));
+            if (observer != nullptr)
+            {
+                observer->report_ready(init_error(WorkerRuntimeStep::StartScheduler));
+                ready_reported = true;
+            }
         }
-        if (!timer_queue_.start(scheduler_))
+        else if (!timer_queue_.start(scheduler_))
         {
-            ++stats_.internal_errors;
-            std::cerr << "worker " << worker_id_ << " timer queue could not start\n";
-            static_cast<void>(scheduler_.shutdown());
-            return;
+            result.emplace(fatal_exit(WorkerRuntimeStep::StartTimerQueue));
+            if (observer != nullptr)
+            {
+                observer->report_ready(init_error(WorkerRuntimeStep::StartTimerQueue));
+                ready_reported = true;
+            }
         }
-        if (!upstream_channel_.start(upstream_fd_.get(), scheduler_, timer_queue_, upstream_channel_config_))
+        else if (!upstream_channel_.start(upstream_fd_.get(), scheduler_, timer_queue_, upstream_channel_config_))
         {
-            ++stats_.internal_errors;
-            std::cerr << "worker " << worker_id_ << " upstream channel could not start\n";
-            static_cast<void>(timer_queue_.close());
-            static_cast<void>(scheduler_.shutdown());
-            static_cast<void>(timer_queue_.stop());
-            return;
+            result.emplace(fatal_exit(WorkerRuntimeStep::StartUpstreamChannel));
+            if (observer != nullptr)
+            {
+                observer->report_ready(init_error(WorkerRuntimeStep::StartUpstreamChannel));
+                ready_reported = true;
+            }
+        }
+        else
+        {
+            if (observer != nullptr)
+            {
+                observer->report_ready(WorkerReadyResult{WorkerReadyOutcome::Ready, std::nullopt});
+                ready_reported = true;
+
+                const bool activate = observer->await_activation(stop_token);
+                if (!activate)
+                {
+                    result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::AwaitActivation));
+                }
+                else if (stop_token.stop_requested())
+                {
+                    result.emplace(requested_stop());
+                }
+                else
+                {
+                    observer->report_activated();
+                    const bool enter_data_plane = observer->await_data_plane(stop_token);
+                    if (!enter_data_plane)
+                        result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::AwaitActivation));
+                    else if (stop_token.stop_requested())
+                        result.emplace(requested_stop());
+                    else
+                        activated = true;
+                }
+            }
+            else if (stop_token.stop_requested())
+            {
+                result.emplace(requested_stop());
+            }
+            else
+            {
+                // A null observer is the standalone/test path and activates
+                // immediately after runtime initialization.
+                activated = true;
+            }
+
+            if (activated)
+            {
+                while (!stop_token.stop_requested())
+                {
+                    const int timeout = (listener_pending_ || upstream_pending_ || scheduler_.has_ready())
+                                            ? 0
+                                            : timer_queue_.wait_timeout(runtime::TimerQueue::Clock::now());
+                    const int ready   = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), timeout);
+                    if (ready < 0)
+                    {
+                        if (errno == EINTR)
+                            continue;
+                        result.emplace(fatal_exit(WorkerRuntimeStep::WaitForEvents, errno));
+                        break;
+                    }
+
+                    for (int index = 0; index < ready; ++index)
+                    {
+                        const auto kind = static_cast<EventKind>(events[static_cast<size_t>(index)].data.u64);
+                        if (kind == EventKind::Wake)
+                        {
+                            drain_wakeup();
+                            continue;
+                        }
+                        if (kind == EventKind::Listener)
+                            listener_pending_ = true;
+                        if (kind == EventKind::Upstream)
+                        {
+                            const uint32_t flags = events[static_cast<size_t>(index)].events;
+                            upstream_pending_    = true;
+                            upstream_error_pending_ |= (flags & EPOLLERR) != 0;
+                            upstream_hangup_pending_ |= (flags & EPOLLHUP) != 0;
+                        }
+                    }
+
+                    if (stop_token.stop_requested())
+                        break;
+                    if (listener_pending_)
+                        drain_listener(stop_token);
+                    if (upstream_pending_)
+                    {
+                        const auto drained = upstream_channel_.drain(kUpstreamReceiveBudget);
+                        upstream_pending_  = drained.has_more;
+                    }
+                    if (upstream_error_pending_ || upstream_hangup_pending_)
+                    {
+                        const bool hangup       = upstream_hangup_pending_;
+                        int        socket_error = 0;
+                        socklen_t  error_length = sizeof(socket_error);
+                        if (::getsockopt(upstream_fd_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &error_length) < 0)
+                            socket_error = errno;
+                        if (socket_error == 0 && upstream_hangup_pending_)
+                            socket_error = ECONNRESET;
+
+                        upstream_error_pending_  = false;
+                        upstream_hangup_pending_ = false;
+                        if (socket_error != 0)
+                            static_cast<void>(upstream_channel_.fail_all(dns::upstream::QueryOutcome::SocketError, socket_error));
+                        if (hangup)
+                        {
+                            upstream_usable_  = false;
+                            upstream_pending_ = false;
+                            upstream_fd_.reset();
+                        }
+                    }
+
+                    const auto expired = timer_queue_.expire(runtime::TimerQueue::Clock::now(), kTimerBudget);
+                    static_cast<void>(scheduler_.run_ready(kReadyBudget));
+                    if (scheduler_.unhandled_root_exceptions() != 0)
+                    {
+                        result.emplace(fatal_exit(WorkerRuntimeStep::UnhandledException));
+                        break;
+                    }
+                    if (expired.schedule_failures != 0 || !runtime_invariants_hold())
+                    {
+                        result.emplace(fatal_exit(WorkerRuntimeStep::RuntimeInvariant));
+                        break;
+                    }
+                }
+
+                if (!result)
+                    result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::UnhandledException));
+            }
         }
     }
-    catch (const std::exception &error)
+    catch (...)
     {
-        ++stats_.internal_errors;
-        std::cerr << "worker " << worker_id_ << " scheduler initialization failed: " << error.what() << '\n';
-        static_cast<void>(scheduler_.close());
-        static_cast<void>(upstream_channel_.close());
-        static_cast<void>(timer_queue_.close());
-        static_cast<void>(upstream_channel_.cancel_all());
-        static_cast<void>(timer_queue_.cancel_all());
-        static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
-        static_cast<void>(upstream_channel_.stop());
-        static_cast<void>(timer_queue_.stop());
-        return;
+        const WorkerRuntimeError error{WorkerRuntimeStep::UnhandledException, 0};
+        if (!ready_reported && observer != nullptr)
+            observer->report_ready(WorkerReadyResult{WorkerReadyOutcome::InitError, error});
+        result.emplace(WorkerRunResult{WorkerRunOutcome::FatalExit, error});
     }
 
-    while (!stop_token.stop_requested())
+    // Every path, including partial initialization and observer failure, joins
+    // here. Keeping cleanup outside the branches prevents double cancellation
+    // and ensures borrowed timer/upstream nodes are released before return.
+    const bool shutdown_clean = shutdown_runtime();
+    capture_runtime_stats();
+
+    WorkerRunResult final_result = result.value_or(fatal_exit(WorkerRuntimeStep::UnhandledException));
+    if (final_result.outcome != WorkerRunOutcome::FatalExit)
     {
-        const int timeout =
-            (listener_pending_ || upstream_pending_ || scheduler_.has_ready()) ? 0 : timer_queue_.wait_timeout(runtime::TimerQueue::Clock::now());
-        const int ready = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), timeout);
-        if (ready < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            std::cerr << "worker " << worker_id_ << " epoll_wait failed: " << std::strerror(errno) << '\n';
-            break;
-        }
-
-        for (int index = 0; index < ready; ++index)
-        {
-            const auto kind = static_cast<EventKind>(events[static_cast<size_t>(index)].data.u64);
-            if (kind == EventKind::Wake)
-            {
-                drain_wakeup();
-                continue;
-            }
-            if (kind == EventKind::Listener)
-                listener_pending_ = true;
-            if (kind == EventKind::Upstream)
-            {
-                const uint32_t flags = events[static_cast<size_t>(index)].events;
-                upstream_pending_    = true;
-                upstream_error_pending_ |= (flags & EPOLLERR) != 0;
-                upstream_hangup_pending_ |= (flags & EPOLLHUP) != 0;
-            }
-        }
-
-        if (stop_token.stop_requested())
-            break;
-        if (listener_pending_)
-            drain_listener(stop_token);
-        if (upstream_pending_)
-        {
-            const auto drained = upstream_channel_.drain(kUpstreamReceiveBudget);
-            upstream_pending_  = drained.has_more;
-        }
-        if (upstream_error_pending_ || upstream_hangup_pending_)
-        {
-            const bool hangup       = upstream_hangup_pending_;
-            int        socket_error = 0;
-            socklen_t  error_length = sizeof(socket_error);
-            if (::getsockopt(upstream_fd_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &error_length) < 0)
-                socket_error = errno;
-            if (socket_error == 0 && upstream_hangup_pending_)
-                socket_error = ECONNRESET;
-
-            upstream_error_pending_  = false;
-            upstream_hangup_pending_ = false;
-            if (socket_error != 0)
-                static_cast<void>(upstream_channel_.fail_all(dns::upstream::QueryOutcome::SocketError, socket_error));
-            if (hangup)
-            {
-                upstream_usable_  = false;
-                upstream_pending_ = false;
-                upstream_fd_.reset();
-            }
-        }
-
-        static_cast<void>(timer_queue_.expire(runtime::TimerQueue::Clock::now(), kTimerBudget));
-        static_cast<void>(scheduler_.run_ready(kReadyBudget));
+        if (scheduler_.unhandled_root_exceptions() != 0)
+            final_result = fatal_exit(WorkerRuntimeStep::UnhandledException);
+        else if (!runtime_invariants_hold())
+            final_result = fatal_exit(WorkerRuntimeStep::RuntimeInvariant);
+        else if (!shutdown_clean)
+            final_result = fatal_exit(WorkerRuntimeStep::Shutdown);
     }
+    return final_result;
+}
 
+bool WorkerLoop::shutdown_runtime() noexcept
+{
     // close() rejects new roots but deliberately leaves schedule() available,
     // allowing cancelled timer waiters to enter the ready queue and unwind.
-    static_cast<void>(scheduler_.close());
-    static_cast<void>(upstream_channel_.close());
-    static_cast<void>(timer_queue_.close());
+    bool clean = scheduler_.close();
+    clean      = upstream_channel_.close() && clean;
+    clean      = timer_queue_.close() && clean;
     static_cast<void>(upstream_channel_.cancel_all());
-    static_cast<void>(timer_queue_.cancel_all());
+    const auto cancelled = timer_queue_.cancel_all();
+    clean                = cancelled.schedule_failures == 0 && clean;
     static_cast<void>(scheduler_.shutdown(kShutdownResumeBudget));
-    if (!upstream_channel_.stop())
-        ++stats_.internal_errors;
-    if (!timer_queue_.stop())
-        ++stats_.internal_errors;
+    clean = upstream_channel_.stop() && clean;
+    clean = timer_queue_.stop() && clean;
+    return clean;
+}
 
+void WorkerLoop::capture_runtime_stats() noexcept
+{
     const auto &upstream_stats          = upstream_channel_.stats();
     stats_.upstream_queries             = upstream_stats.queries_sent;
     stats_.upstream_responses           = upstream_stats.responses_completed;
@@ -347,6 +432,11 @@ void WorkerLoop::run(std::stop_token thread_stop_token) noexcept
     stats_.upstream_unmatched_responses = upstream_stats.unmatched_responses;
     stats_.internal_errors += static_cast<uint64_t>(scheduler_.unhandled_root_exceptions() + scheduler_.invariant_failures() +
                                                     timer_queue_.invariant_failures() + upstream_stats.invariant_failures);
+}
+
+bool WorkerLoop::runtime_invariants_hold() const noexcept
+{
+    return scheduler_.invariant_failures() == 0 && timer_queue_.invariant_failures() == 0 && upstream_channel_.stats().invariant_failures == 0;
 }
 
 void WorkerLoop::request_stop() const noexcept
@@ -374,7 +464,7 @@ void WorkerLoop::drain_wakeup() const noexcept
 void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
 {
     std::array<std::byte, protocol::kDownstreamReceiveBufferSize> buffer{};
-    size_t                                      datagrams = 0;
+    size_t                                                        datagrams = 0;
 
     while (!stop_token.stop_requested() && datagrams < kReceiveBudget)
     {
@@ -473,8 +563,8 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                 if (snapshot && snapshot->blocklist.matches(question.name))
                 {
                     ++stats_.blocked_queries;
-                    auto refused = protocol::make_error_response(
-                        *decision.request, protocol::ResponseCode::Refused, true, protocol::kDownstreamResponseBudget);
+                    auto refused =
+                        protocol::make_error_response(*decision.request, protocol::ResponseCode::Refused, true, protocol::kDownstreamResponseBudget);
                     if (!refused)
                     {
                         ++stats_.internal_errors;
@@ -486,8 +576,8 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
 
             if (decision.response.empty())
             {
-                const bool cache_eligible = cache_shard_.capacity() != 0 && !decision.request->header.authenticated_data &&
-                                            !decision.request->header.checking_disabled;
+                const bool cache_eligible =
+                    cache_shard_.capacity() != 0 && !decision.request->header.authenticated_data && !decision.request->header.checking_disabled;
                 std::optional<Cache::CacheKey> cache_key;
                 if (cache_eligible)
                 {
@@ -542,8 +632,7 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
                                     if (cacheable)
                                     {
                                         Cache::CacheHit candidate{std::move(cacheable->addresses), cacheable->ttl};
-                                        auto cache_wire = make_cache_hit_response(
-                                            *decision.request, candidate, protocol::kDownstreamResponseBudget);
+                                        auto cache_wire = make_cache_hit_response(*decision.request, candidate, protocol::kDownstreamResponseBudget);
                                         if (cache_wire)
                                         {
                                             cache_shard_.put(std::move(*cache_key), std::move(candidate.addresses), candidate.remaining_ttl,
@@ -564,8 +653,8 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
             }
             if (decision.response.empty())
             {
-                auto servfail = protocol::make_error_response(
-                    *decision.request, protocol::ResponseCode::ServFail, true, protocol::kDownstreamResponseBudget);
+                auto servfail =
+                    protocol::make_error_response(*decision.request, protocol::ResponseCode::ServFail, true, protocol::kDownstreamResponseBudget);
                 if (!servfail)
                 {
                     ++stats_.internal_errors;

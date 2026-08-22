@@ -93,6 +93,7 @@ add_library(dns_core STATIC
     runtime/TimerQueue.cpp
     upstream/UpstreamChannel.cpp
     WorkerLoop.cpp
+    WorkerSupervisor.cpp
 )
 
 target_include_directories(dns_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -164,7 +165,8 @@ if(BUILD_TESTING)
     dns_pro_set_warnings(dns_lifecycle_tests)
     dns_pro_enable_sanitizers(dns_lifecycle_tests)
     add_test(NAME dns_lifecycle_tests COMMAND dns_lifecycle_tests)
-    set_tests_properties(dns_lifecycle_tests PROPERTIES TIMEOUT 10)
+    target_compile_definitions(dns_lifecycle_tests PRIVATE DNS_PRO_REQUIRE_SOCKET_TESTS=$<BOOL:${DNS_PRO_REQUIRE_SOCKET_TESTS}>)
+    set_tests_properties(dns_lifecycle_tests PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
     add_executable(dns_reactor_tests tests/reactor_tests.cpp)
     target_link_libraries(dns_reactor_tests PRIVATE dns_core)

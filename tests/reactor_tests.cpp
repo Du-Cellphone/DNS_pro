@@ -27,10 +27,8 @@ namespace dns::server
 
 struct WorkerLoopTestPeer
 {
-    static void send_response(WorkerLoop                  &worker,
-                              const std::vector<std::byte> &response,
-                              const sockaddr              *client_address,
-                              socklen_t                     client_length) noexcept
+    static void send_response(WorkerLoop &worker, const std::vector<std::byte> &response, const sockaddr *client_address,
+                              socklen_t client_length) noexcept
     {
         worker.send_response(response, client_address, client_length);
     }
@@ -48,6 +46,26 @@ void require(bool condition, std::string_view message)
     std::cerr << "reactor test failed: " << message << '\n';
     std::exit(EXIT_FAILURE);
 }
+
+class CapturedWorkerThread final
+{
+public:
+    explicit CapturedWorkerThread(dns::server::WorkerLoop *worker)
+        : thread_([this, worker](std::stop_token token) { result_ = worker->run(token); })
+    {
+    }
+
+    void join()
+    {
+        thread_.join();
+        require(result_ && result_->outcome == dns::server::WorkerRunOutcome::RequestedStop && !result_->error,
+                "a directly-run worker must report a structured RequestedStop result");
+    }
+
+private:
+    std::optional<dns::server::WorkerRunResult> result_;
+    std::jthread                                thread_;
+};
 
 struct BlackholeUpstream
 {
@@ -107,7 +125,7 @@ std::vector<std::byte> make_query(uint16_t id, dns::protocol::RecordType type, s
 
 std::vector<std::byte> make_exact_size_opt_query(uint16_t id, size_t target_size)
 {
-    auto wire = make_query(id, dns::protocol::RecordType::A);
+    auto             wire              = make_query(id, dns::protocol::RecordType::A);
     constexpr size_t opt_envelope_size = 11;
     require(wire.size() + opt_envelope_size <= target_size, "OPT boundary fixture must have room for its RR envelope");
 
@@ -115,11 +133,11 @@ std::vector<std::byte> make_exact_size_opt_query(uint16_t id, size_t target_size
     require(rdata_size <= 65'535, "OPT boundary fixture RDATA must fit RDLENGTH");
     wire[10] = std::byte{0};
     wire[11] = std::byte{1};
-    wire.push_back(std::byte{0});    // root owner
+    wire.push_back(std::byte{0}); // root owner
     wire.push_back(std::byte{0});
     wire.push_back(std::byte{0x29}); // OPT
     wire.push_back(std::byte{0x02});
-    wire.push_back(std::byte{0});    // advertised UDP payload size 512
+    wire.push_back(std::byte{0}); // advertised UDP payload size 512
     wire.insert(wire.end(), 4, std::byte{0});
     wire.push_back(static_cast<std::byte>((rdata_size >> 8U) & 0xffU));
     wire.push_back(static_cast<std::byte>(rdata_size & 0xffU));
@@ -290,9 +308,9 @@ void test_owned_datagrams_survive_initial_suspend()
 
     // All 82 packets are now queued before the worker starts, so more than one
     // receive budget must be drained without relying on a second EPOLLET edge.
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
-    auto         second_wire = receive_response(second_client.get(), "second client");
-    auto         second      = dns::protocol::parse_message(second_wire);
+    CapturedWorkerThread worker_thread{worker.get()};
+    auto                 second_wire = receive_response(second_client.get(), "second client");
+    auto                 second      = dns::protocol::parse_message(second_wire);
     require(second && second->header.id == 0x2222, "second coroutine must retain the second packet and client address");
 
     std::array<bool, burst_size> seen{};
@@ -331,21 +349,22 @@ void test_udp_reactor_responses()
 
     DNS       service;
     DNSConfig config;
-    config.worker_count   = 1;
-    config.manager_count  = 0;
-    config.cache_capacity = 8;
-    config.port           = 0;
-    config.upstream       = blackhole_config(upstream->port);
+    config.worker_count            = 1;
+    config.runtime_updates_enabled = false;
+    config.cache_capacity          = 8;
+    config.port                    = 0;
+    config.upstream                = blackhole_config(upstream->port);
     require(service.init(config), "reactor service fixture must initialize");
 
-    require(service.start(), "reactor service fixture must start after the suite capability probe");
+    const auto started = service.start();
+    require(static_cast<bool>(started), "reactor service fixture must start after the suite capability probe");
 
     const auto port = service.bound_port();
     require(port && *port != 0, "port-zero binding must publish the assigned local port");
 
     auto disabled_update = service.replace_blocked_domains({"disabled.example"});
     require(!disabled_update && disabled_update.error().code == dns::server::FilterUpdateErrorCode::ControlPlaneDisabled,
-            "a running service without a manager must reject runtime reload without blocking");
+            "a running service without an update coordinator must reject runtime reload without blocking");
 
     dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
     require(static_cast<bool>(client), "UDP client fixture must be created");
@@ -367,9 +386,9 @@ void test_udp_reactor_responses()
 
     for (const size_t query_size : {size_t{511}, dns::protocol::kClassicDnsUdpPayloadLimit})
     {
-        const uint16_t id = query_size == 511 ? uint16_t{0x2501} : uint16_t{0x2502};
-        auto opt_response_wire = exchange(client.get(), *port, make_exact_size_opt_query(id, query_size), "classic UDP OPT boundary query");
-        auto opt_response      = dns::protocol::parse_message(opt_response_wire);
+        const uint16_t id                = query_size == 511 ? uint16_t{0x2501} : uint16_t{0x2502};
+        auto           opt_response_wire = exchange(client.get(), *port, make_exact_size_opt_query(id, query_size), "classic UDP OPT boundary query");
+        auto           opt_response      = dns::protocol::parse_message(opt_response_wire);
         require(opt_response && opt_response->header.id == id &&
                     opt_response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NotImp) &&
                     opt_response->questions.size() == 1 && opt_response->answers.empty() && opt_response->authorities.empty() &&
@@ -416,7 +435,8 @@ void test_udp_reactor_responses()
             "the reactor must silently drop both ordinary and oversized QR=1 packets instead of creating a response loop");
 
     service.request_stop();
-    service.join();
+    const auto exit = service.join();
+    require(exit.code == DNSServiceExitCode::ExplicitStop, "reactor service shutdown must report ExplicitStop");
     require(!service.is_running(), "eventfd must stop an epoll-blocked reactor after traffic");
 }
 
@@ -439,7 +459,7 @@ void test_upstream_response_is_forwarded()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "forwarding client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
     send_query(client.get(), worker->bound_port(), make_query(0xbeef, dns::protocol::RecordType::A));
 
     std::array<std::byte, 4096> forwarded_buffer{};
@@ -463,8 +483,8 @@ void test_upstream_response_is_forwarded()
     auto client_wire = receive_response(client.get(), "forwarding client");
     auto response    = dns::protocol::parse_message(client_wire);
     require(response && response->header.id == 0xbeef && response->header.is_response &&
-                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) &&
-                response->header.authenticated_data && response->header.checking_disabled,
+                response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && response->header.authenticated_data &&
+                response->header.checking_disabled,
             "the worker must restore the client transaction ID and transparently forward upstream AD/CD flags");
     require(response->answers.size() == 1 &&
                 response->answers.front().rdata == std::vector<std::byte>{std::byte{203}, std::byte{0}, std::byte{113}, std::byte{7}},
@@ -496,11 +516,11 @@ void test_oversized_upstream_response_keeps_waiter_pending()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "oversized-upstream client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
 
     send_query(client.get(), worker->bound_port(), make_query(0x5101, dns::protocol::RecordType::A, "oversized.example"));
-    auto first_forwarded = receive_forwarded_query(*upstream, "oversized response followed by a valid response");
-    auto valid_response  = make_a_response(first_forwarded.packet);
+    auto first_forwarded    = receive_forwarded_query(*upstream, "oversized response followed by a valid response");
+    auto valid_response     = make_a_response(first_forwarded.packet);
     auto oversized_response = valid_response;
     oversized_response.resize(dns::protocol::kUpstreamReceiveBufferSize + 1, std::byte{0});
     send_upstream_response(*upstream, first_forwarded, oversized_response);
@@ -508,8 +528,8 @@ void test_oversized_upstream_response_keeps_waiter_pending()
 
     auto first_wire = receive_response(client.get(), "valid response after oversized upstream response");
     auto first      = dns::protocol::parse_message(first_wire);
-    require(first && first->header.id == 0x5101 &&
-                first->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && first->answers.size() == 1,
+    require(first && first->header.id == 0x5101 && first->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) &&
+                first->answers.size() == 1,
             "an oversized upstream datagram must not complete or remove the pending waiter before a later valid response");
 
     send_query(client.get(), worker->bound_port(), make_query(0x5102, dns::protocol::RecordType::A, "timeout.example"));
@@ -526,8 +546,8 @@ void test_oversized_upstream_response_keeps_waiter_pending()
 
     worker->request_stop();
     worker_thread.join();
-    require(worker->stats().upstream_queries == 2 && worker->stats().upstream_invalid_responses == 2 &&
-                worker->stats().upstream_responses == 1 && worker->stats().upstream_timeouts == 1 && worker->stats().responses_sent == 2,
+    require(worker->stats().upstream_queries == 2 && worker->stats().upstream_invalid_responses == 2 && worker->stats().upstream_responses == 1 &&
+                worker->stats().upstream_timeouts == 1 && worker->stats().responses_sent == 2,
             "oversized upstream datagrams must be counted invalid without completing either pending waiter");
 }
 
@@ -550,7 +570,7 @@ void test_truncated_upstream_response_is_transparent_and_not_cached()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "TC-response client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
     for (uint16_t id : {uint16_t{0x5201}, uint16_t{0x5202}})
     {
         send_query(client.get(), worker->bound_port(), make_query(id, dns::protocol::RecordType::A, "truncated.example"));
@@ -584,14 +604,14 @@ void test_cache_reconstruction_overflow_becomes_one_upstream_miss()
     addresses.reserve(40);
     for (size_t index = 0; index < 40; ++index)
         addresses.push_back(Cache::IPAddress::v4({192, 0, 2, static_cast<uint8_t>(index + 1)}));
-    cache.shard(0).put(Cache::CacheKey{*name, static_cast<uint16_t>(dns::protocol::RecordType::A),
-                                       static_cast<uint16_t>(dns::protocol::RecordClass::IN)},
-                       std::move(addresses), 60, Cache::Clock::now());
+    cache.shard(0).put(
+        Cache::CacheKey{*name, static_cast<uint16_t>(dns::protocol::RecordType::A), static_cast<uint16_t>(dns::protocol::RecordClass::IN)},
+        std::move(addresses), 60, Cache::Clock::now());
 
-    auto upstream_config            = blackhole_config(upstream->port);
-    upstream_config.query_timeout   = std::chrono::milliseconds{500};
-    upstream_config.id_reuse_guard  = std::chrono::milliseconds{500};
-    auto worker_result              = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
+    auto upstream_config           = blackhole_config(upstream->port);
+    upstream_config.query_timeout  = std::chrono::milliseconds{500};
+    upstream_config.id_reuse_guard = std::chrono::milliseconds{500};
+    auto worker_result             = dns::server::WorkerLoop::create(0, 0, cache.shard(0), upstream_config);
     require(worker_result.has_value(), "cache-overflow worker fixture must initialize");
     auto worker = std::move(*worker_result);
 
@@ -601,7 +621,7 @@ void test_cache_reconstruction_overflow_becomes_one_upstream_miss()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "cache-overflow client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
     send_query(client.get(), worker->bound_port(), make_query(0x5301, dns::protocol::RecordType::A, "overflow.example"));
     auto forwarded = receive_forwarded_query(*upstream, "cache reconstruction larger than 512 bytes");
 
@@ -631,7 +651,7 @@ void test_send_response_rejects_oversized_payload()
     require(upstream.has_value(), "send-guard fixture must initialize after the suite capability probe");
 
     Cache::DNS_Cache cache{1, 1};
-    auto worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0), blackhole_config(upstream->port));
+    auto             worker_result = dns::server::WorkerLoop::create(0, 0, cache.shard(0), blackhole_config(upstream->port));
     require(worker_result.has_value(), "send-guard worker fixture must initialize");
     auto worker = std::move(*worker_result);
 
@@ -652,8 +672,7 @@ void test_send_response_rejects_oversized_payload()
 
     std::array<std::byte, 1> unexpected{};
     errno = 0;
-    require(::recvfrom(client.get(), unexpected.data(), unexpected.size(), 0, nullptr, nullptr) == -1 &&
-                (errno == EAGAIN || errno == EWOULDBLOCK),
+    require(::recvfrom(client.get(), unexpected.data(), unexpected.size(), 0, nullptr, nullptr) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
             "the final send guard must not emit a UDP datagram larger than the downstream response budget");
     require(worker->stats().oversized_responses == 1 && worker->stats().responses_sent == 0 && worker->stats().send_errors == 0,
             "the final send guard must diagnose an oversized response without treating it as a sendto failure");
@@ -678,7 +697,7 @@ void test_positive_rrsets_are_cached_without_upstream_requery()
     require(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
             "positive-cache client receive timeout must be configured");
 
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
 
     send_query(client.get(), worker->bound_port(), make_query(0x1001, dns::protocol::RecordType::A, "Cache.Example."));
     auto first_a_forwarded = receive_forwarded_query(*upstream, "first A cache miss");
@@ -747,17 +766,18 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
 
     DNS       service;
     DNSConfig config;
-    config.worker_count   = 1;
-    config.manager_count  = 1;
-    config.cache_capacity = 8;
-    config.port           = 0;
-    config.upstream       = blackhole_config(upstream->port);
+    config.worker_count            = 1;
+    config.runtime_updates_enabled = true;
+    config.cache_capacity          = 8;
+    config.port                    = 0;
+    config.upstream                = blackhole_config(upstream->port);
     require(service.init(config), "runtime-filter service fixture must initialize");
-    require(service.start(), "runtime-filter service fixture must start after the suite capability probe");
+    const auto started = service.start();
+    require(static_cast<bool>(started), "runtime-filter service fixture must start after the suite capability probe");
 
     auto ready_update = service.replace_blocked_domains({});
     require(ready_update && ready_update->generation == 2 && ready_update->rule_count == 0,
-            "start must return with the manager ready to process an immediate replacement");
+            "start must return with the update coordinator ready to process an immediate replacement");
 
     const auto port = service.bound_port();
     require(port.has_value(), "runtime-filter service must publish its bound port");
@@ -784,7 +804,8 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
             "the warmed response must be served from cache before the rule is installed");
 
     auto update = service.replace_blocked_domains({"blocked.example"});
-    require(update && update->generation == 3 && update->rule_count == 1, "the manager must publish a complete third-generation blocklist");
+    require(update && update->generation == 3 && update->rule_count == 1,
+            "the update coordinator must publish a complete third-generation blocklist");
     require(service.filter_version() == std::optional{*update}, "the public filter version must identify the committed snapshot");
 
     send_query(client.get(), *port, make_query(0x3003, dns::protocol::RecordType::A, "www.blocked.example"));
@@ -824,7 +845,8 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
             "cache hits, refused responses, rollback, and rule removal must not emit another upstream packet");
 
     service.request_stop();
-    service.join();
+    const auto exit = service.join();
+    require(exit.code == DNSServiceExitCode::ExplicitStop, "runtime-filter service shutdown must report ExplicitStop");
 }
 
 void test_configured_filter_snapshot_reaches_dns_workers()
@@ -834,14 +856,15 @@ void test_configured_filter_snapshot_reaches_dns_workers()
 
     DNS       service;
     DNSConfig config;
-    config.worker_count    = 1;
-    config.manager_count   = 0;
-    config.cache_capacity  = 8;
-    config.port            = 0;
-    config.blocked_domains = {"blocked.example"};
-    config.upstream        = blackhole_config(upstream->port);
+    config.worker_count            = 1;
+    config.runtime_updates_enabled = false;
+    config.cache_capacity          = 8;
+    config.port                    = 0;
+    config.blocked_domains         = {"blocked.example"};
+    config.upstream                = blackhole_config(upstream->port);
     require(service.init(config), "configured filter service fixture must initialize");
-    require(service.start(), "configured-filter service fixture must start after the suite capability probe");
+    const auto started = service.start();
+    require(static_cast<bool>(started), "configured-filter service fixture must start after the suite capability probe");
 
     const auto port = service.bound_port();
     require(port.has_value(), "configured filter service must publish its bound port");
@@ -866,7 +889,8 @@ void test_configured_filter_snapshot_reaches_dns_workers()
             "a configured REFUSED decision must not emit an upstream packet");
 
     service.request_stop();
-    service.join();
+    const auto exit = service.join();
+    require(exit.code == DNSServiceExitCode::ExplicitStop, "configured-filter service shutdown must report ExplicitStop");
 }
 
 void test_shutdown_cancels_pending_upstream_query()
@@ -884,7 +908,7 @@ void test_shutdown_cancels_pending_upstream_query()
 
     dns::runtime::UniqueFd client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
     require(static_cast<bool>(client), "pending-shutdown client fixture must be created");
-    std::jthread worker_thread{[loop = worker.get()](std::stop_token token) { loop->run(token); }};
+    CapturedWorkerThread worker_thread{worker.get()};
     send_query(client.get(), worker->bound_port(), make_query(0xcafe, dns::protocol::RecordType::A));
 
     std::array<std::byte, 4096> forwarded{};

@@ -20,6 +20,35 @@
 namespace dns::server
 {
 
+enum class FilterRunnerReadyCode
+{
+    Ready,
+    AlreadyRunning,
+};
+
+struct FilterRunnerReadyResult
+{
+    FilterRunnerReadyCode code{FilterRunnerReadyCode::Ready};
+};
+
+enum class FilterRunnerExitCode
+{
+    RequestedStop,
+    FatalExit,
+};
+
+struct FilterRunnerResult
+{
+    FilterRunnerExitCode code{FilterRunnerExitCode::RequestedStop};
+};
+
+class FilterRunnerObserver
+{
+public:
+    virtual ~FilterRunnerObserver()                                    = default;
+    virtual void report_ready(FilterRunnerReadyResult result) noexcept = 0;
+};
+
 struct FilterVersion
 {
     FilterGeneration generation{0};
@@ -66,8 +95,8 @@ public:
     [[nodiscard]] FilterUpdateFuture submit_replace(std::vector<std::string> rules);
     // One-shot blocking runner. The caller owns the invoking thread and must
     // keep this controller alive until that thread has been joined.
-    void run(std::stop_token stop_token) noexcept;
-    void close() noexcept;
+    [[nodiscard]] FilterRunnerResult run(std::stop_token stop_token, FilterRunnerObserver *observer = nullptr) noexcept;
+    void                             close() noexcept;
 
     [[nodiscard]] const FilterSnapshotSlot    &snapshot_slot() const noexcept { return active_snapshot_; }
     [[nodiscard]] FilterSnapshot               snapshot() const noexcept;

@@ -58,6 +58,70 @@ struct WorkerInitError
 {
     WorkerInitStep step;
     int            error_number{0};
+
+    bool operator==(const WorkerInitError &) const = default;
+};
+
+enum class WorkerRuntimeStep : uint8_t
+{
+    StartScheduler,
+    StartTimerQueue,
+    StartUpstreamChannel,
+    AwaitActivation,
+    WaitForEvents,
+    RuntimeInvariant,
+    UnhandledException,
+    Shutdown,
+};
+
+struct WorkerRuntimeError
+{
+    WorkerRuntimeStep step{WorkerRuntimeStep::UnhandledException};
+    int               error_number{0};
+
+    bool operator==(const WorkerRuntimeError &) const = default;
+};
+
+enum class WorkerReadyOutcome : uint8_t
+{
+    Ready,
+    InitError,
+};
+
+struct WorkerReadyResult
+{
+    WorkerReadyOutcome                outcome{WorkerReadyOutcome::InitError};
+    std::optional<WorkerRuntimeError> error;
+
+    bool operator==(const WorkerReadyResult &) const = default;
+};
+
+enum class WorkerRunOutcome : uint8_t
+{
+    RequestedStop,
+    FatalExit,
+};
+
+struct WorkerRunResult
+{
+    WorkerRunOutcome                  outcome{WorkerRunOutcome::FatalExit};
+    std::optional<WorkerRuntimeError> error;
+
+    bool operator==(const WorkerRunResult &) const = default;
+};
+
+// The observer is owned by the worker's stable control record. Every callback
+// is noexcept so the worker can reliably report startup and activation state
+// even while unwinding an otherwise-fatal runtime failure.
+class WorkerRunObserver
+{
+public:
+    virtual ~WorkerRunObserver() = default;
+
+    virtual void               report_ready(WorkerReadyResult result) noexcept       = 0;
+    [[nodiscard]] virtual bool await_activation(std::stop_token stop_token) noexcept = 0;
+    virtual void               report_activated() noexcept                           = 0;
+    [[nodiscard]] virtual bool await_data_plane(std::stop_token stop_token) noexcept = 0;
 };
 
 struct WorkerStats
@@ -109,19 +173,18 @@ class WorkerLoop final
 public:
     using CreateResult = std::expected<std::unique_ptr<WorkerLoop>, WorkerInitError>;
 
-    static CreateResult create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
-    static CreateResult create(size_t                  worker_id,
-                               uint16_t                port,
-                               Cache::CacheShard      &cache_shard,
-                               const FilterSnapshotSlot &filter_snapshots,
-                               const UpstreamConfig   &upstream_config = {});
+    static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
+    static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const FilterSnapshotSlot &filter_snapshots,
+                                   const UpstreamConfig &upstream_config = {});
     static DatagramDecision evaluate_datagram(std::span<const std::byte> packet, bool truncated);
 
     WorkerLoop(const WorkerLoop &)            = delete;
     WorkerLoop &operator=(const WorkerLoop &) = delete;
 
-    void run(std::stop_token stop_token) noexcept;
-    void request_stop() const noexcept;
+    // A null observer preserves the standalone/test behavior: after runtime
+    // initialization succeeds, the worker is activated immediately.
+    [[nodiscard]] WorkerRunResult run(std::stop_token stop_token, WorkerRunObserver *observer = nullptr) noexcept;
+    void                          request_stop() const noexcept;
 
     [[nodiscard]] size_t             worker_id() const noexcept { return worker_id_; }
     [[nodiscard]] uint16_t           bound_port() const noexcept { return bound_port_; }
@@ -159,9 +222,12 @@ private:
     }
 
     std::expected<void, WorkerInitError> initialize(uint16_t port, const UpstreamConfig &upstream_config);
-    void                            drain_wakeup() const noexcept;
-    void                            drain_listener(std::stop_token stop_token) noexcept;
-    runtime::Task<void>             process_datagram(ClientDatagram datagram);
+    [[nodiscard]] bool                   shutdown_runtime() noexcept;
+    void                                 capture_runtime_stats() noexcept;
+    [[nodiscard]] bool                   runtime_invariants_hold() const noexcept;
+    void                                 drain_wakeup() const noexcept;
+    void                                 drain_listener(std::stop_token stop_token) noexcept;
+    runtime::Task<void>                  process_datagram(ClientDatagram datagram);
     void send_response(const std::vector<std::byte> &response, const sockaddr *client_address, socklen_t client_length) noexcept;
 
     size_t                         worker_id_{0};

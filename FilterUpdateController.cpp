@@ -65,15 +65,24 @@ FilterUpdateFuture FilterUpdateController::submit_replace(std::vector<std::strin
     return future;
 }
 
-void FilterUpdateController::run(std::stop_token stop_token) noexcept
+FilterRunnerResult FilterUpdateController::run(std::stop_token stop_token, FilterRunnerObserver *observer) noexcept
 {
+    FilterRunnerResult result{};
     {
         std::scoped_lock lock{mutex_};
         if (runner_active_)
-            return;
+        {
+            if (observer != nullptr)
+                observer->report_ready(FilterRunnerReadyResult{FilterRunnerReadyCode::AlreadyRunning});
+            return FilterRunnerResult{FilterRunnerExitCode::FatalExit};
+        }
         runner_active_ = true;
     }
 
+    if (observer != nullptr)
+        observer->report_ready(FilterRunnerReadyResult{FilterRunnerReadyCode::Ready});
+
+    try
     {
         std::stop_callback    forward_stop{stop_token, [this]
                                         {
@@ -98,8 +107,13 @@ void FilterUpdateController::run(std::stop_token stop_token) noexcept
             complete(*command, apply(command->rules, build_stop_token));
         }
     }
+    catch (...)
+    {
+        result.code = FilterRunnerExitCode::FatalExit;
+    }
 
     finish_run();
+    return result;
 }
 
 void FilterUpdateController::close() noexcept
