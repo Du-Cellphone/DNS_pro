@@ -1,7 +1,7 @@
 #pragma once
 
 #include "DNS_Cache.h"
-#include "FilterContext.h"
+#include "FilterPublication.h"
 #include "WorkerLoop.h"
 #include "common/Expected.h"
 
@@ -20,28 +20,7 @@
 namespace dns::server
 {
 
-inline constexpr FilterGeneration kUnobservedFilterGeneration = 0;
-inline constexpr size_t           kInvalidWorkerId            = std::numeric_limits<size_t>::max();
-
-enum class WorkerRegistrationState : uint8_t
-{
-    Unregistered,
-    Starting,
-    Registered,
-};
-
-// Kept at a stable, cache-line-aligned address for the later generation/cohort
-// protocol. Stage 12 deliberately leaves observed_generation at Unobserved: a
-// worker becoming Ready is not evidence that it passed a generation safe point.
-struct alignas(64) WorkerEpoch final
-{
-    std::atomic<uint64_t>                published_instance_id{0};
-    std::atomic<FilterGeneration>        observed_generation{kUnobservedFilterGeneration};
-    std::atomic<WorkerRegistrationState> registration_state{WorkerRegistrationState::Unregistered};
-    std::atomic<uint64_t>                quiesced_through_instance_id{0};
-};
-
-static_assert(alignof(WorkerEpoch) >= 64);
+inline constexpr size_t kInvalidWorkerId = std::numeric_limits<size_t>::max();
 
 enum class WorkerRecordState : uint8_t
 {
@@ -212,7 +191,7 @@ private:
     WorkerEpoch                           epoch_;
 };
 
-class WorkerSupervisor final
+class WorkerSupervisor final : public FilterPublicationSink
 {
 public:
     using RuntimeFatalReporter = void (*)(void *context, size_t worker_id, uint64_t instance_id, const WorkerRunResult &result) noexcept;
@@ -222,7 +201,7 @@ public:
         size_t                     worker_count{0};
         uint16_t                   requested_port{0};
         Cache::DNS_Cache          *cache{nullptr};
-        const FilterSnapshotSlot  *filter_snapshots{nullptr};
+        FilterPublicationState    *filter_publication{nullptr};
         UpstreamConfig             upstream{};
         WorkerSupervisorFaultHooks fault_hooks{};
         void                      *fatal_reporter_context{nullptr};
@@ -248,6 +227,10 @@ public:
     // supervisor event predicate, never C-owned WorkerLoop/jthread fields.
     void request_stop() noexcept;
 
+    // A calls only this stable event endpoint. C remains the sole thread that
+    // looks up current WorkerLoop instances and writes their generation fds.
+    void snapshot_published(FilterGeneration generation) noexcept override;
+
     // Emergency successor path. The caller must first join the C thread. It
     // returns false if C is still active or a worker thread could not be joined.
     [[nodiscard]] bool emergency_join_all() noexcept;
@@ -255,6 +238,7 @@ public:
     // Internal deterministic seams used by lifecycle tests. They enqueue work
     // for the C thread; neither method reads C-owned instance fields.
     void inject_abrupt_exit_for_testing() noexcept;
+    void inject_abrupt_exit_after_next_publication_for_testing() noexcept;
     bool inject_worker_unexpected_stop_for_testing(size_t worker_id) noexcept;
     bool inject_worker_precommit_failure_for_testing(size_t worker_id) noexcept;
     void inject_emergency_join_failure_once_for_testing() noexcept;
@@ -273,12 +257,15 @@ private:
     [[nodiscard]] std::optional<SupervisorActivationError> await_activation_command_and_workers();
     [[nodiscard]] SupervisorRunResult                      monitor_active_workers();
 
-    void               worker_entry(WorkerRecord &record, uint64_t instance_id, std::stop_token thread_stop_token) noexcept;
-    void               report_worker_ready(WorkerRecord &record, uint64_t instance_id, WorkerReadyResult result) noexcept;
-    [[nodiscard]] bool await_worker_activation(WorkerRecord &record, uint64_t instance_id, std::stop_token stop_token) noexcept;
-    void               report_worker_activated(WorkerRecord &record, uint64_t instance_id) noexcept;
-    [[nodiscard]] bool await_worker_data_plane(WorkerRecord &record, uint64_t instance_id, std::stop_token stop_token) noexcept;
-    void               report_worker_completion(WorkerRecord &record, uint64_t instance_id, WorkerRunResult result) noexcept;
+    void                                        worker_entry(WorkerRecord &record, uint64_t instance_id, std::stop_token thread_stop_token) noexcept;
+    void                                        report_worker_ready(WorkerRecord &record, uint64_t instance_id, WorkerReadyResult result) noexcept;
+    [[nodiscard]] WorkerRunObserver::GateAction await_worker_activation(WorkerRecord &record, uint64_t instance_id,
+                                                                        std::stop_token stop_token) noexcept;
+    void                                        report_worker_activated(WorkerRecord &record, uint64_t instance_id) noexcept;
+    [[nodiscard]] WorkerRunObserver::GateAction await_worker_data_plane(WorkerRecord &record, uint64_t instance_id,
+                                                                        std::stop_token stop_token) noexcept;
+    void                                        report_worker_filter_progress(WorkerRecord &record, uint64_t instance_id) noexcept;
+    void                                        report_worker_completion(WorkerRecord &record, uint64_t instance_id, WorkerRunResult result) noexcept;
 
     void               publish_startup(SupervisorStartupResult result) noexcept;
     void               publish_activation(SupervisorActivationResult result) noexcept;
@@ -304,8 +291,11 @@ private:
     bool                                       stop_requested_{false};
     bool                                       run_started_{false};
     bool                                       abrupt_exit_requested_{false};
+    bool                                       abrupt_exit_after_publication_requested_{false};
     bool                                       emergency_join_failure_once_{false};
     std::optional<size_t>                      unexpected_stop_worker_;
+    FilterGeneration                           published_generation_{kInitialFilterGeneration};
+    bool                                       snapshot_publication_pending_{false};
     std::atomic<bool>                          run_active_{false};
 };
 

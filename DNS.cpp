@@ -3,6 +3,7 @@
 #include "WorkerSupervisor.h"
 
 #include <cerrno>
+#include <exception>
 #include <new>
 #include <system_error>
 #include <utility>
@@ -95,15 +96,32 @@ DNSFatalError make_role_fatal(DNSFatalCode code, DNSControlRole role) noexcept
 
 } // namespace
 
-struct DNS::ControlPlaneState final : dns::server::FilterRunnerObserver
+struct DNS::ControlPlaneState final : dns::server::FilterRunnerObserver, dns::server::SnapshotReclaimerObserver
 {
+    ControlPlaneState(dns::server::FilterSnapshot initial_snapshot, size_t worker_count)
+        : publication(std::move(initial_snapshot), dns::server::FilterPublicationState::Config{.maximum_workers = worker_count})
+    {
+    }
+
     void reset(uint64_t value_attempt_id) noexcept
     {
         std::scoped_lock lock{mutex};
         attempt_id = value_attempt_id;
         coordinator_ready.reset();
+        reclaimer_ready.reset();
         coordinator_result.reset();
+        reclaimer_result.reset();
         supervisor_result.reset();
+    }
+
+    void report_reclaimer_ready(dns::server::SnapshotReclaimerReadyResult result) noexcept override
+    {
+        {
+            std::scoped_lock lock{mutex};
+            if (!reclaimer_ready)
+                reclaimer_ready = result;
+        }
+        changed.notify_all();
     }
 
     void report_ready(dns::server::FilterRunnerReadyResult result) noexcept override
@@ -136,18 +154,33 @@ struct DNS::ControlPlaneState final : dns::server::FilterRunnerObserver
         changed.notify_all();
     }
 
-    std::mutex                                          mutex;
-    std::condition_variable_any                         changed;
-    uint64_t                                            attempt_id{0};
-    std::optional<dns::server::FilterRunnerReadyResult> coordinator_ready;
-    std::optional<dns::server::FilterRunnerResult>      coordinator_result;
-    std::optional<dns::server::SupervisorRunResult>     supervisor_result;
+    void publish_reclaimer_result(dns::server::SnapshotReclaimerResult result) noexcept
+    {
+        {
+            std::scoped_lock lock{mutex};
+            if (!reclaimer_result)
+                reclaimer_result = std::move(result);
+        }
+        changed.notify_all();
+    }
+
+    dns::server::FilterPublicationState                      publication;
+    std::mutex                                               mutex;
+    std::condition_variable_any                              changed;
+    uint64_t                                                 attempt_id{0};
+    std::optional<dns::server::FilterRunnerReadyResult>      coordinator_ready;
+    std::optional<dns::server::SnapshotReclaimerReadyResult> reclaimer_ready;
+    std::optional<dns::server::FilterRunnerResult>           coordinator_result;
+    std::optional<dns::server::SnapshotReclaimerResult>      reclaimer_result;
+    std::optional<dns::server::SupervisorRunResult>          supervisor_result;
 };
 
 struct DNS::FaultInjection final
 {
     bool                                    coordinator_thread_failure{false};
     bool                                    coordinator_init_failure{false};
+    bool                                    reclaimer_thread_failure{false};
+    bool                                    reclaimer_init_failure{false};
     bool                                    supervisor_thread_failure{false};
     dns::server::WorkerSupervisorFaultHooks supervisor;
 
@@ -162,7 +195,14 @@ DNS::DNS() = default;
 DNS::~DNS()
 {
     request_stop();
-    static_cast<void>(join());
+    if (join().code == DNSServiceExitCode::TeardownIncomplete)
+    {
+        // Returning from the destructor would release publication/worker
+        // owners that a non-joined thread may still borrow. Fail fast and let
+        // the process watchdog own the unrecoverable case instead of risking
+        // a use-after-free during member destruction.
+        std::terminate();
+    }
 }
 
 bool DNS::init(const DNSConfig &config)
@@ -187,6 +227,12 @@ bool DNS::init(const DNSConfig &config)
 
     try
     {
+        if (!dns::server::validate_filter_rule_set(config.blocked_domains))
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            init_in_progress_ = false;
+            return false;
+        }
         auto context = dns::server::build_filter_snapshot(config.blocked_domains, dns::server::kInitialFilterGeneration);
         if (!context)
         {
@@ -195,9 +241,9 @@ bool DNS::init(const DNSConfig &config)
             return false;
         }
 
-        auto filter_updates = std::make_unique<dns::server::FilterUpdateController>(std::move(*context));
+        auto control        = std::make_unique<ControlPlaneState>(std::move(*context), config.worker_count);
+        auto filter_updates = std::make_unique<dns::server::FilterUpdateController>(control->publication);
         auto cache          = std::make_unique<Cache::DNS_Cache>(config.cache_capacity, config.worker_count);
-        auto control        = std::make_unique<ControlPlaneState>();
         auto faults         = std::make_unique<FaultInjection>();
 
         std::scoped_lock lock{lifecycle_mutex_};
@@ -295,7 +341,7 @@ DNSStartResult DNS::start()
             .worker_count           = config_.worker_count,
             .requested_port         = config_.port,
             .cache                  = cache_.get(),
-            .filter_snapshots       = &filter_updates_->snapshot_slot(),
+            .filter_publication     = &control_->publication,
             .upstream               = config_.upstream,
             .fault_hooks            = faults_->supervisor,
             .fatal_reporter_context = this,
@@ -328,6 +374,26 @@ DNSStartResult DNS::start()
 
     if (config_.runtime_updates_enabled)
     {
+        if (faults_->reclaimer_thread_failure)
+        {
+            return fail_start(make_start_error(DNSStartErrorCode::ReclaimerThreadCreationFailed, DNSControlRole::SnapshotReclaimer, EAGAIN));
+        }
+        try
+        {
+            std::jthread     reclaimer{[this, attempt_id](std::stop_token token) { reclaimer_main(token, attempt_id); }};
+            std::scoped_lock lock{lifecycle_mutex_};
+            reclaimer_thread_ = std::move(reclaimer);
+        }
+        catch (const std::system_error &error)
+        {
+            return fail_start(
+                make_start_error(DNSStartErrorCode::ReclaimerThreadCreationFailed, DNSControlRole::SnapshotReclaimer, error.code().value()));
+        }
+        catch (...)
+        {
+            return fail_start(make_start_error(DNSStartErrorCode::ReclaimerThreadCreationFailed, DNSControlRole::SnapshotReclaimer, ENOMEM));
+        }
+
         if (faults_->coordinator_thread_failure)
         {
             return fail_start(make_start_error(DNSStartErrorCode::CoordinatorThreadCreationFailed, DNSControlRole::FilterUpdateCoordinator, EAGAIN));
@@ -372,6 +438,21 @@ DNSStartResult DNS::start()
     const std::stop_token startup_token = startup_stop_source_.get_token();
     if (config_.runtime_updates_enabled)
     {
+        bool reclaimer_ready{false};
+        bool reclaimer_exited{false};
+        {
+            std::unique_lock lock{control_->mutex};
+            control_->changed.wait(lock, startup_token,
+                                   [this] { return control_->reclaimer_ready.has_value() || control_->reclaimer_result.has_value(); });
+            reclaimer_ready  = control_->reclaimer_ready && control_->reclaimer_ready->code == dns::server::SnapshotReclaimerReadyCode::Ready;
+            reclaimer_exited = control_->reclaimer_result.has_value();
+        }
+        if (!reclaimer_ready)
+            return fail_start(make_start_error(startup_token.stop_requested() ? DNSStartErrorCode::Cancelled : DNSStartErrorCode::ReclaimerInitFailed,
+                                               DNSControlRole::SnapshotReclaimer));
+        if (reclaimer_exited)
+            return fail_start(make_start_error(DNSStartErrorCode::ReclaimerInitFailed, DNSControlRole::SnapshotReclaimer));
+
         bool coordinator_ready{false};
         bool coordinator_exited{false};
         {
@@ -462,8 +543,10 @@ DNSStartResult DNS::start()
         // linearization point. Holding both locks makes the required-role
         // liveness check part of the same all-or-nothing Active commit.
         std::scoped_lock lock{lifecycle_mutex_, control_->mutex};
-        if (!control_->coordinator_result)
+        if (!control_->coordinator_result && !control_->reclaimer_result)
             commit_startup();
+        else if (control_->reclaimer_result)
+            commit_error = make_start_error(DNSStartErrorCode::ReclaimerInitFailed, DNSControlRole::SnapshotReclaimer);
         else
             commit_error = make_start_error(DNSStartErrorCode::CoordinatorInitFailed, DNSControlRole::FilterUpdateCoordinator);
     }
@@ -519,7 +602,13 @@ void DNS::request_stop() noexcept
         }
     }
     if (abandon_initialized)
+    {
+        initialized_filter.reset();
+        initialized_control.reset();
+        initialized_faults.reset();
+        initialized_cache.reset();
         return;
+    }
     if (stop_runtime)
         request_runtime_stop();
 }
@@ -614,6 +703,63 @@ std::optional<dns::server::FilterVersion> DNS::filter_version() const noexcept
     if (filter_updates_)
         return filter_updates_->current_version();
     return health_.filter_version;
+}
+
+void DNS::reclaimer_main(std::stop_token stop_token, uint64_t attempt_id) noexcept
+{
+    if (faults_ && faults_->reclaimer_init_failure)
+    {
+        control_->report_reclaimer_ready(dns::server::SnapshotReclaimerReadyResult{dns::server::SnapshotReclaimerReadyCode::AlreadyRunning});
+        control_->publish_reclaimer_result(dns::server::SnapshotReclaimerResult{dns::server::SnapshotReclaimerExitCode::FatalExit, nullptr});
+        return;
+    }
+
+    dns::server::SnapshotReclaimerResult result;
+    try
+    {
+        result = control_->publication.run_reclaimer(stop_token, control_.get());
+    }
+    catch (...)
+    {
+        result = dns::server::SnapshotReclaimerResult{dns::server::SnapshotReclaimerExitCode::FatalExit, nullptr};
+    }
+    const dns::server::SnapshotReclaimerExitCode exit_code  = result.code;
+    auto                                         diagnostic = result.diagnostic;
+    control_->publish_reclaimer_result(std::move(result));
+
+    bool startup_failure{false};
+    bool runtime_failure{false};
+    {
+        std::scoped_lock lock{lifecycle_mutex_};
+        const bool       expected_stop = startup_stop_source_.stop_requested() || state_ == DNSLifecycleState::Stopping ||
+                                   state_ == DNSLifecycleState::Stopped || state_ == DNSLifecycleState::Failed;
+        if (!expected_stop && startup_attempt_id_ == attempt_id)
+        {
+            if (state_ == DNSLifecycleState::Starting)
+            {
+                if (stop_cause_ == StopCause::None)
+                {
+                    stop_cause_    = StopCause::StartupFailure;
+                    startup_error_ = make_start_error(DNSStartErrorCode::ReclaimerInitFailed, DNSControlRole::SnapshotReclaimer);
+                }
+                state_ = DNSLifecycleState::Stopping;
+                startup_stop_source_.request_stop();
+                startup_failure = true;
+            }
+            else if (state_ == DNSLifecycleState::Active)
+            {
+                DNSFatalError error =
+                    make_role_fatal(exit_code == dns::server::SnapshotReclaimerExitCode::GracePeriodStalled ? DNSFatalCode::GracePeriodStalled
+                                                                                                            : DNSFatalCode::ReclaimerExited,
+                                    DNSControlRole::SnapshotReclaimer);
+                error.grace_diagnostic = std::move(diagnostic);
+                runtime_failure        = accept_fatal_locked(std::move(error));
+            }
+        }
+        lifecycle_changed_.notify_all();
+    }
+    if (startup_failure || runtime_failure)
+        request_runtime_stop();
 }
 
 void DNS::coordinator_main(std::stop_token stop_token, uint64_t attempt_id) noexcept
@@ -766,9 +912,7 @@ void DNS::request_runtime_stop() noexcept
     startup_stop_source_.request_stop();
     update_admission_open_ = false;
     if (filter_updates_)
-        filter_updates_->close();
-    if (coordinator_thread_.joinable())
-        coordinator_thread_.request_stop();
+        filter_updates_->seal();
     if (supervisor_)
         supervisor_->request_stop();
     if (supervisor_thread_.joinable())
@@ -790,35 +934,19 @@ DNSServiceExitResult DNS::finish_teardown(bool request_explicit_stop) noexcept
 
     request_runtime_stop();
 
-    std::jthread coordinator;
+    const auto teardown_incomplete = [this]() noexcept
     {
         std::scoped_lock lock{lifecycle_mutex_};
-        coordinator = std::move(coordinator_thread_);
-    }
-    if (coordinator.joinable())
-    {
-        coordinator.request_stop();
-        try
-        {
-            coordinator.join();
-        }
-        catch (...)
-        {
-        }
-    }
-    if (coordinator.joinable())
-    {
-        std::scoped_lock lock{lifecycle_mutex_};
-        coordinator_thread_       = std::move(coordinator);
         state_                    = DNSLifecycleState::Stopping;
         health_.state             = DNSHealthState::Unavailable;
         health_.available_workers = 0;
         lifecycle_changed_.notify_all();
         return DNSServiceExitResult{DNSServiceExitCode::TeardownIncomplete, startup_error_, fatal_error_};
-    }
+    };
 
-    if (supervisor_)
-        supervisor_->request_stop();
+    // C is drained first. join_and_reset() releases every worker-local owner
+    // before it publishes quiesced_through_instance_id, allowing B (or an
+    // emergency successor) to finish any committed publication.
     std::jthread supervisor_thread;
     {
         std::scoped_lock lock{lifecycle_mutex_};
@@ -837,23 +965,173 @@ DNSServiceExitResult DNS::finish_teardown(bool request_explicit_stop) noexcept
     }
     if (supervisor_thread.joinable())
     {
-        std::scoped_lock lock{lifecycle_mutex_};
-        supervisor_thread_        = std::move(supervisor_thread);
-        state_                    = DNSLifecycleState::Stopping;
-        health_.state             = DNSHealthState::Unavailable;
-        health_.available_workers = 0;
-        lifecycle_changed_.notify_all();
-        return DNSServiceExitResult{DNSServiceExitCode::TeardownIncomplete, startup_error_, fatal_error_};
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            supervisor_thread_ = std::move(supervisor_thread);
+        }
+        return teardown_incomplete();
     }
     if (supervisor_ && !supervisor_->emergency_join_all())
+        return teardown_incomplete();
+
+    bool reclaimer_available{false};
     {
         std::scoped_lock lock{lifecycle_mutex_};
-        state_                    = DNSLifecycleState::Stopping;
-        health_.state             = DNSHealthState::Unavailable;
-        health_.available_workers = 0;
-        lifecycle_changed_.notify_all();
-        return DNSServiceExitResult{DNSServiceExitCode::TeardownIncomplete, startup_error_, fatal_error_};
+        reclaimer_available = reclaimer_thread_.joinable();
     }
+    auto join_failed_reclaimer = [this, &reclaimer_available]() noexcept -> bool
+    {
+        std::jthread reclaimer;
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            reclaimer = std::move(reclaimer_thread_);
+        }
+        if (reclaimer.joinable())
+        {
+            try
+            {
+                reclaimer.join();
+            }
+            catch (...)
+            {
+            }
+        }
+        if (reclaimer.joinable())
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            reclaimer_thread_ = std::move(reclaimer);
+            return false;
+        }
+        reclaimer_available = false;
+        return control_ == nullptr || control_->publication.emergency_reclaim_converged();
+    };
+
+    bool reclaimer_exited{false};
+    if (control_ != nullptr)
+    {
+        std::scoped_lock lock{control_->mutex};
+        reclaimer_exited = control_->reclaimer_result.has_value();
+    }
+    if (reclaimer_exited && !join_failed_reclaimer())
+        return teardown_incomplete();
+
+    if (config_.runtime_updates_enabled && filter_updates_ != nullptr)
+    {
+        // This wakes A without stopping its thread. If A is still waiting for
+        // a committed cohort, B remains live and the worker quiescence above
+        // lets that wait complete first.
+        filter_updates_->request_terminal_detach();
+
+        bool coordinator_exists{false};
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            coordinator_exists = coordinator_thread_.joinable();
+        }
+        bool coordinator_finished = !coordinator_exists;
+        while (!coordinator_finished)
+        {
+            bool observed_reclaimer_exit{false};
+            {
+                std::unique_lock lock{control_->mutex};
+                control_->changed.wait(
+                    lock, [this, &reclaimer_available]
+                    { return control_->coordinator_result.has_value() || (reclaimer_available && control_->reclaimer_result.has_value()); });
+                coordinator_finished    = control_->coordinator_result.has_value();
+                observed_reclaimer_exit = control_->reclaimer_result.has_value();
+            }
+            if (!coordinator_finished && observed_reclaimer_exit && reclaimer_available)
+            {
+                if (!join_failed_reclaimer())
+                    return teardown_incomplete();
+            }
+        }
+    }
+
+    std::jthread coordinator;
+    {
+        std::scoped_lock lock{lifecycle_mutex_};
+        coordinator = std::move(coordinator_thread_);
+    }
+    if (coordinator.joinable())
+    {
+        try
+        {
+            coordinator.join();
+        }
+        catch (...)
+        {
+        }
+    }
+    if (coordinator.joinable())
+    {
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            coordinator_thread_ = std::move(coordinator);
+        }
+        return teardown_incomplete();
+    }
+
+    if (filter_updates_ != nullptr)
+    {
+        auto successor_result = filter_updates_->complete_committed_by_successor();
+        if (successor_result != dns::server::FilterSuccessorCompletionResult::Completed)
+        {
+            // A has been joined, so the stable journal can be taken over. Only
+            // an explicit ReclaimerUnavailable result proves that joining B
+            // cannot block; an internal wait failure must retain all owners.
+            if (successor_result != dns::server::FilterSuccessorCompletionResult::ReclaimerUnavailable || !reclaimer_available ||
+                !join_failed_reclaimer())
+                return teardown_incomplete();
+            successor_result = filter_updates_->complete_committed_by_successor();
+            if (successor_result != dns::server::FilterSuccessorCompletionResult::Completed)
+                return teardown_incomplete();
+        }
+    }
+
+    if (control_ != nullptr)
+    {
+        control_->publication.seal_publication();
+        if (!control_->publication.detach_terminal_snapshot())
+            return teardown_incomplete();
+    }
+
+    if (reclaimer_available)
+    {
+        control_->publication.request_reclaimer_shutdown();
+        std::jthread reclaimer;
+        {
+            std::scoped_lock lock{lifecycle_mutex_};
+            reclaimer = std::move(reclaimer_thread_);
+        }
+        if (reclaimer.joinable())
+        {
+            try
+            {
+                reclaimer.join();
+            }
+            catch (...)
+            {
+            }
+        }
+        if (reclaimer.joinable())
+        {
+            {
+                std::scoped_lock lock{lifecycle_mutex_};
+                reclaimer_thread_ = std::move(reclaimer);
+            }
+            return teardown_incomplete();
+        }
+        reclaimer_available = false;
+        if (!control_->publication.emergency_reclaim_converged())
+            return teardown_incomplete();
+    }
+    else if (control_ != nullptr && !control_->publication.emergency_reclaim_converged())
+    {
+        return teardown_incomplete();
+    }
+
+    if (filter_updates_ != nullptr && filter_updates_->complete_committed_by_successor() != dns::server::FilterSuccessorCompletionResult::Completed)
+        return teardown_incomplete();
 
     std::unique_ptr<Cache::DNS_Cache>                    cache;
     std::unique_ptr<ControlPlaneState>                   control;
@@ -878,9 +1156,8 @@ DNSServiceExitResult DNS::finish_teardown(bool request_explicit_stop) noexcept
         exit_result = exit_result_locked();
     }
 
-    // Keep every borrowed dependency alive until the stable supervisor and
-    // all records have been destroyed. The active snapshot is released only
-    // after that point; the cache is last.
+    // B no longer scans epochs, so the stable registry can now be destroyed.
+    // The controller still borrows ControlPlaneState and therefore dies first.
     supervisor.reset();
     filter_updates.reset();
     control.reset();
@@ -921,7 +1198,40 @@ void DNS::inject_coordinator_runtime_failure_for_test() noexcept
 {
     std::scoped_lock lock{lifecycle_mutex_};
     if (filter_updates_)
-        filter_updates_->close();
+        filter_updates_->request_terminal_detach();
+}
+
+void DNS::inject_coordinator_postcommit_failure_for_test() noexcept
+{
+    std::scoped_lock lock{lifecycle_mutex_};
+    if (filter_updates_)
+        filter_updates_->inject_postcommit_failure_for_testing();
+}
+
+void DNS::inject_reclaimer_thread_failure_for_test() noexcept
+{
+    if (faults_)
+        faults_->reclaimer_thread_failure = true;
+}
+
+void DNS::inject_reclaimer_init_failure_for_test() noexcept
+{
+    if (faults_)
+        faults_->reclaimer_init_failure = true;
+}
+
+void DNS::inject_reclaimer_runtime_failure_for_test() noexcept
+{
+    std::scoped_lock lock{lifecycle_mutex_};
+    if (control_)
+        control_->publication.inject_reclaimer_failure_for_testing();
+}
+
+void DNS::inject_reclaimer_postcommit_failure_for_test() noexcept
+{
+    std::scoped_lock lock{lifecycle_mutex_};
+    if (control_)
+        control_->publication.inject_reclaimer_failure_after_next_commit_for_testing();
 }
 
 void DNS::inject_supervisor_thread_failure_for_test() noexcept
@@ -935,6 +1245,13 @@ void DNS::inject_supervisor_runtime_failure_for_test() noexcept
     std::scoped_lock lock{lifecycle_mutex_};
     if (supervisor_)
         supervisor_->inject_abrupt_exit_for_testing();
+}
+
+void DNS::inject_supervisor_postcommit_failure_for_test() noexcept
+{
+    std::scoped_lock lock{lifecycle_mutex_};
+    if (supervisor_)
+        supervisor_->inject_abrupt_exit_after_next_publication_for_testing();
 }
 
 void DNS::inject_worker_create_failure_for_test(size_t worker_id, dns::server::WorkerInitStep step, int error_number) noexcept

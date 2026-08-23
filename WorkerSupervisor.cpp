@@ -68,17 +68,19 @@ public:
 
     void report_ready(WorkerReadyResult result) noexcept override { supervisor_.report_worker_ready(record_, instance_id_, std::move(result)); }
 
-    bool await_activation(std::stop_token stop_token) noexcept override
+    WorkerRunObserver::GateAction await_activation(std::stop_token stop_token) noexcept override
     {
         return supervisor_.await_worker_activation(record_, instance_id_, stop_token);
     }
 
     void report_activated() noexcept override { supervisor_.report_worker_activated(record_, instance_id_); }
 
-    bool await_data_plane(std::stop_token stop_token) noexcept override
+    WorkerRunObserver::GateAction await_data_plane(std::stop_token stop_token) noexcept override
     {
         return supervisor_.await_worker_data_plane(record_, instance_id_, stop_token);
     }
+
+    void report_filter_progress() noexcept override { supervisor_.report_worker_filter_progress(record_, instance_id_); }
 
 private:
     WorkerSupervisor &supervisor_;
@@ -127,6 +129,11 @@ WorkerSupervisor::WorkerSupervisor(Config config)
         record->observer_ = std::make_unique<WorkerRecordObserver>(*this, *record);
         records_.push_back(std::move(record));
     }
+    if (config_.filter_publication != nullptr)
+    {
+        published_generation_ = config_.filter_publication->current_generation();
+        config_.filter_publication->set_publication_sink(this);
+    }
 }
 
 WorkerSupervisor::~WorkerSupervisor()
@@ -137,6 +144,8 @@ WorkerSupervisor::~WorkerSupervisor()
         wakeup_.wait(lock, [this] { return !run_active_.load(std::memory_order_acquire); });
     }
     static_cast<void>(emergency_join_all());
+    if (config_.filter_publication != nullptr)
+        config_.filter_publication->set_publication_sink(nullptr);
     // Destroy records while mutex_/wakeup_ and every callback target are still
     // alive. WorkerRecord's destructor is the final stop/join safety net if an
     // emergency join could not prove completion.
@@ -307,14 +316,35 @@ std::optional<SupervisorStartupError> WorkerSupervisor::create_workers()
 
         ++record.instance_id_;
         record.state_ = WorkerRecordState::Creating;
-        record.epoch_.observed_generation.store(kUnobservedFilterGeneration, std::memory_order_relaxed);
-        record.epoch_.registration_state.store(WorkerRegistrationState::Starting, std::memory_order_relaxed);
-        record.epoch_.published_instance_id.store(record.instance_id_, std::memory_order_release);
+        std::optional<FilterWorkerRegistration> registration;
+        if (config_.filter_publication != nullptr)
+        {
+            registration = config_.filter_publication->register_worker(record.worker_id_, record.instance_id_, record.epoch_);
+            if (!registration)
+            {
+                return SupervisorStartupError{
+                    .code          = SupervisorStartupErrorCode::InternalError,
+                    .worker_id     = record.worker_id_,
+                    .instance_id   = record.instance_id_,
+                    .create_error  = std::nullopt,
+                    .runtime_error = std::nullopt,
+                };
+            }
+        }
+        else
+        {
+            record.epoch_.observed_generation.store(kUnobservedFilterGeneration, std::memory_order_relaxed);
+            record.epoch_.registration_state.store(WorkerRegistrationState::Starting, std::memory_order_relaxed);
+            record.epoch_.published_instance_id.store(record.instance_id_, std::memory_order_release);
+        }
 
         if (config_.fault_hooks.create_failure_worker == record.worker_id_)
         {
             const WorkerInitError injected{config_.fault_hooks.create_failure_step,
                                            configured_error_or(config_.fault_hooks.create_failure_error, EIO)};
+            registration.reset();
+            if (config_.filter_publication != nullptr)
+                config_.filter_publication->quiesce_worker(record.worker_id_, record.instance_id_, record.epoch_);
             return SupervisorStartupError{
                 .code          = SupervisorStartupErrorCode::WorkerCreateFailed,
                 .worker_id     = record.worker_id_,
@@ -326,11 +356,15 @@ std::optional<SupervisorStartupError> WorkerSupervisor::create_workers()
         }
 
         WorkerLoop::CreateResult created =
-            config_.filter_snapshots != nullptr
-                ? WorkerLoop::create(record.worker_id_, port, config_.cache->shard(record.worker_id_), *config_.filter_snapshots, config_.upstream)
+            config_.filter_publication != nullptr
+                ? WorkerLoop::create(record.worker_id_, port, config_.cache->shard(record.worker_id_), *config_.filter_publication,
+                                     std::move(registration->snapshot), record.epoch_, record.instance_id_, config_.upstream)
                 : WorkerLoop::create(record.worker_id_, port, config_.cache->shard(record.worker_id_), config_.upstream);
         if (!created)
         {
+            registration.reset();
+            if (config_.filter_publication != nullptr)
+                config_.filter_publication->quiesce_worker(record.worker_id_, record.instance_id_, record.epoch_);
             return SupervisorStartupError{
                 .code          = SupervisorStartupErrorCode::WorkerCreateFailed,
                 .worker_id     = record.worker_id_,
@@ -439,8 +473,18 @@ std::optional<SupervisorStartupError> WorkerSupervisor::await_worker_readiness()
                         .runtime_error = record.ready_.result.error,
                     };
                 }
+                if (config_.filter_publication != nullptr &&
+                    !config_.filter_publication->mark_worker_registered(record.worker_id_, record.instance_id_, record.epoch_))
+                {
+                    // The publication that raced Ready captured this Starting
+                    // token. Wake the gate waiter; it must refresh on its own
+                    // thread before C accepts Ready.
+                    wakeup_.notify_all();
+                    continue;
+                }
                 record.state_ = WorkerRecordState::Ready;
-                record.epoch_.registration_state.store(WorkerRegistrationState::Registered, std::memory_order_release);
+                if (config_.filter_publication == nullptr)
+                    record.epoch_.registration_state.store(WorkerRegistrationState::Registered, std::memory_order_release);
                 continue;
             }
 
@@ -530,14 +574,36 @@ SupervisorRunResult WorkerSupervisor::monitor_active_workers()
         {
             std::unique_lock lock{mutex_};
             wakeup_.wait(lock,
-                         [this] {
+                         [this]
+                         {
                              return stop_requested_locked() || abrupt_exit_requested_ || unexpected_stop_worker_.has_value() ||
-                                    has_unconsumed_completion_locked();
+                                    snapshot_publication_pending_ || has_unconsumed_completion_locked();
                          });
             if (abrupt_exit_requested_)
                 throw InjectedSupervisorFailure{};
             if (stop_requested_locked())
                 return requested_stop_result();
+
+            if (snapshot_publication_pending_)
+            {
+                snapshot_publication_pending_ = false;
+                for (const auto &owned_record : records_)
+                {
+                    if (owned_record->current_instance_ != nullptr && !owned_record->current_instance_->request_filter_refresh())
+                    {
+                        return SupervisorRunResult{
+                            .outcome       = SupervisorRunOutcome::FatalExit,
+                            .error_code    = SupervisorRunErrorCode::InternalError,
+                            .worker_id     = owned_record->worker_id_,
+                            .instance_id   = owned_record->instance_id_,
+                            .error_number  = errno,
+                            .startup_error = std::nullopt,
+                            .worker_result = std::nullopt,
+                        };
+                    }
+                }
+                continue;
+            }
 
             if (unexpected_stop_worker_)
             {
@@ -638,22 +704,29 @@ void WorkerSupervisor::report_worker_ready(WorkerRecord &record, uint64_t instan
         record.instance_stop_source_.request_stop();
 }
 
-bool WorkerSupervisor::await_worker_activation(WorkerRecord &record, uint64_t instance_id, std::stop_token stop_token) noexcept
+WorkerRunObserver::GateAction WorkerSupervisor::await_worker_activation(WorkerRecord &record, uint64_t instance_id,
+                                                                        std::stop_token stop_token) noexcept
 {
     try
     {
         std::unique_lock lock{mutex_};
         const bool       ready = wakeup_.wait(lock, stop_token,
-                                              [this, &record, instance_id] {
+                                              [this, &record, instance_id]
+                                              {
                                             return instance_id != record.instance_id_ || activation_requested_ || stop_requested_locked() ||
-                                                   record.instance_stop_source_.stop_requested();
+                                                   record.instance_stop_source_.stop_requested() ||
+                                                   (config_.filter_publication != nullptr &&
+                                                    config_.filter_publication->worker_needs_refresh(instance_id, record.epoch_));
                                         });
-        return ready && instance_id == record.instance_id_ && activation_requested_ && !stop_requested_locked() &&
-               !record.instance_stop_source_.stop_requested();
+        if (!ready || instance_id != record.instance_id_ || stop_requested_locked() || record.instance_stop_source_.stop_requested())
+            return WorkerRunObserver::GateAction::Stop;
+        if (config_.filter_publication != nullptr && config_.filter_publication->worker_needs_refresh(instance_id, record.epoch_))
+            return WorkerRunObserver::GateAction::RefreshFilter;
+        return activation_requested_ ? WorkerRunObserver::GateAction::Proceed : WorkerRunObserver::GateAction::Stop;
     }
     catch (...)
     {
-        return false;
+        return WorkerRunObserver::GateAction::Stop;
     }
 }
 
@@ -669,7 +742,8 @@ void WorkerSupervisor::report_worker_activated(WorkerRecord &record, uint64_t in
     wakeup_.notify_all();
 }
 
-bool WorkerSupervisor::await_worker_data_plane(WorkerRecord &record, uint64_t instance_id, std::stop_token stop_token) noexcept
+WorkerRunObserver::GateAction WorkerSupervisor::await_worker_data_plane(WorkerRecord &record, uint64_t instance_id,
+                                                                        std::stop_token stop_token) noexcept
 {
     try
     {
@@ -678,15 +752,31 @@ bool WorkerSupervisor::await_worker_data_plane(WorkerRecord &record, uint64_t in
                                                  [this, &record, instance_id]
                                                  {
                                                return instance_id != record.instance_id_ || data_plane_released_ || stop_requested_locked() ||
-                                                      abrupt_exit_requested_ || record.instance_stop_source_.stop_requested();
+                                                      abrupt_exit_requested_ || record.instance_stop_source_.stop_requested() ||
+                                                      (config_.filter_publication != nullptr &&
+                                                       config_.filter_publication->worker_needs_refresh(instance_id, record.epoch_));
                                            });
-        return released && instance_id == record.instance_id_ && data_plane_released_ && !stop_requested_locked() && !abrupt_exit_requested_ &&
-               !record.instance_stop_source_.stop_requested();
+        if (!released || instance_id != record.instance_id_ || stop_requested_locked() || abrupt_exit_requested_ ||
+            record.instance_stop_source_.stop_requested())
+            return WorkerRunObserver::GateAction::Stop;
+        if (config_.filter_publication != nullptr && config_.filter_publication->worker_needs_refresh(instance_id, record.epoch_))
+            return WorkerRunObserver::GateAction::RefreshFilter;
+        return data_plane_released_ ? WorkerRunObserver::GateAction::Proceed : WorkerRunObserver::GateAction::Stop;
     }
     catch (...)
     {
-        return false;
+        return WorkerRunObserver::GateAction::Stop;
     }
+}
+
+void WorkerSupervisor::report_worker_filter_progress(WorkerRecord &record, uint64_t instance_id) noexcept
+{
+    {
+        std::scoped_lock lock{mutex_};
+        if (instance_id != record.instance_id_)
+            return;
+    }
+    wakeup_.notify_all();
 }
 
 void WorkerSupervisor::report_worker_completion(WorkerRecord &record, uint64_t instance_id, WorkerRunResult result) noexcept
@@ -787,6 +877,23 @@ void WorkerSupervisor::request_stop() noexcept
     request_all_worker_stops();
 }
 
+void WorkerSupervisor::snapshot_published(FilterGeneration generation) noexcept
+{
+    {
+        std::scoped_lock lock{mutex_};
+        if (generation <= published_generation_)
+            return;
+        published_generation_         = generation;
+        snapshot_publication_pending_ = true;
+        if (abrupt_exit_after_publication_requested_)
+        {
+            abrupt_exit_after_publication_requested_ = false;
+            abrupt_exit_requested_                   = true;
+        }
+    }
+    wakeup_.notify_all();
+}
+
 void WorkerSupervisor::request_all_worker_stops() noexcept
 {
     for (const auto &record : records_)
@@ -882,8 +989,13 @@ bool WorkerSupervisor::join_and_reset(WorkerRecord &record) noexcept
 
     record.current_thread_ = std::jthread{};
     record.current_instance_.reset();
-    record.epoch_.quiesced_through_instance_id.store(record.instance_id_, std::memory_order_release);
-    record.epoch_.registration_state.store(WorkerRegistrationState::Unregistered, std::memory_order_release);
+    if (config_.filter_publication != nullptr)
+        config_.filter_publication->quiesce_worker(record.worker_id_, record.instance_id_, record.epoch_);
+    else
+    {
+        record.epoch_.quiesced_through_instance_id.store(record.instance_id_, std::memory_order_release);
+        record.epoch_.registration_state.store(WorkerRegistrationState::Unregistered, std::memory_order_release);
+    }
     {
         std::scoped_lock lock{mutex_};
         record.state_ = WorkerRecordState::Offline;
@@ -913,6 +1025,15 @@ void WorkerSupervisor::inject_abrupt_exit_for_testing() noexcept
     {
         std::scoped_lock lock{mutex_};
         abrupt_exit_requested_ = true;
+    }
+    wakeup_.notify_all();
+}
+
+void WorkerSupervisor::inject_abrupt_exit_after_next_publication_for_testing() noexcept
+{
+    {
+        std::scoped_lock lock{mutex_};
+        abrupt_exit_after_publication_requested_ = true;
     }
     wakeup_.notify_all();
 }

@@ -50,9 +50,13 @@ Cuckoo Filter 只能作为 RadixTree 前置加速结构，不能改变上述匹�
 - 控制面按提交顺序串行构建候选快照。候选完整构建成功后才允许发布；任一规则非法时，旧快照对象和过滤行为保持不变。
 - 同步更新接口返回成功后，随后进入过滤阶段的请求必须看到新快照。已经通过旧快照过滤并等待上游的请求可以按旧决定完成。
 - 停止过程不再接受新更新；排队或仍在构建但尚未发布的更新必须得到明确的取消结果，不能在停止后覆盖快照。
-- 控制面更新队列的命令数必须有固定上限；超过上限的请求立即失败，避免完整规则集合无界积压。单次规则集合的大小限制不属于本阶段。
-- `runtime_updates_enabled=false` 允许静态过滤但不创建更新协调线程，并明确拒绝运行期更新；`true` 启用唯一的串行更新协调线程。worker 生命周期由独立的 supervisor 线程管理，不能通过“多个 manager”配置复制控制角色。
+- 控制面更新队列最多暂存 64 个命令；单次完整替换最多包含 100,000 条规则、原始/规范化规则数据最多 16 MiB，排队命令的原始规则数据合计最多 64 MiB。任一上限在重型构建前检查并立即返回结构化错误，避免完整规则集合无界积压。已编译唯一规则的 canonical wire-key 字节数用于 retired-byte 记账；它是受控的 accounted bytes，不等同于精确 RSS。
+- `runtime_updates_enabled=false` 允许静态过滤但不创建更新协调线程 A 或回收线程 B，并明确拒绝运行期更新；`true` 启用唯一串行 A 和专用 B。worker 生命周期由独立的 supervisor C 管理，不能通过“多个 manager”配置复制控制角色。
 - 配置中的原始规则字符串仅作为启动输入；已发布的数据面状态只持有编译后的不可变快照，控制面可在命令排队和构建期间暂存一份 owned rules。
+- active snapshot 的原子 exchange 是不可逆 commit point。commit 前的停止返回取消且 generation 不变；commit 后的调用继续等待该次发布固定捕获的 exact worker cohort，不能声称回滚或取消。
+- 每个 worker 只在自身线程的 generation 安全点切换本地 `shared_ptr<const FilterContext>`；请求热路径只读该本地快照，不执行 per-request atomic shared_ptr load 或引用计数。过滤匹配同步结束，任何树内指针、引用或迭代器都不得跨越上游查询的 `co_await`。
+- publication 在低频 mutex 下与 participant 注册线性化，并固定捕获 `(worker_id, instance_id, WorkerEpoch*)`。B 只接受同一 exact token 的 generation ack，或 C 在 join、销毁 WorkerLoop 并释放本地 snapshot 后发布的 quiescence；Exited、心跳或从 active 列表移除都不是回收证明。
+- 同一时刻最多有一个普通 retired generation。稳定 retirement record 始终持有旧 owner；完整 cohort 收敛后先完成已 commit future，随后由 B 析构 sole old owner并归还 credit，因此同步 API 不承担析构尾延迟，而下一次重型构建仍受背压。最终 active owner 使用独立 terminal record。30 秒 grace timeout 只产生包含 pending token/observed generation/accounted bytes 的 fatal 诊断，绝不强制回收。
 
 ## 缓存语义
 
@@ -82,8 +86,9 @@ canonical QNAME + QTYPE + QCLASS
 - 协程只能由所属 worker 的 scheduler 恢复。
 - 响应、超时、取消和网络错误只能有一个成为等待操作的最终完成原因。
 - coroutine frame、文件描述符、定时器和 pending query 必须具有明确且可测试的 owner。
-- 过滤规则在控制面完整构建后，以不可变快照形式原子发布。
-- 初始启动是 all-or-nothing；Ready worker 依次通过 activation gate 并停在 data-plane gate，服务提交 Active 前不能处理数据报。运行期 worker 意外退出在阶段 12 统一使完整服务失败；配置化的进程内重启留待稳定 instance/cohort 协议完成后启用。
+- 过滤规则在控制面完整构建后，以不可变快照形式原子发布；A 只向 C 发送 generation 事件，C 用独立 eventfd 唤醒空闲 worker。Ready/activation/data-plane gate 同样能返回 Refresh 动作，避免 Starting participant 因尚未进入 epoll 而阻塞 grace period。
+- 初始启动是 all-or-nothing；B、A、C 和全部 worker Ready 后，worker 依次通过 activation gate 并停在 data-plane gate，服务提交 Active 前不能处理数据报。阶段 13 仍将运行期 worker 意外退出升级为完整服务失败；配置化的进程内重启在阶段 14 启用。
+- 正常停止先 seal publication，再由 C join/reset worker，随后完成 committed cohort；C 执行线程可以在 drain 后先 join，但 DNS-owned WorkerRecord registry 必须继续存活。A detach terminal owner 后退出，B 析构所有 stable owner，最后才销毁 registry。A/B/C 任一故障时，外部 teardown coordinator 只有在 join 对应的原唯一 writer 后才能接管，并且仍须用 exact ack/quiescence 证明安全；若 DNS 析构时仍无法证明所有 worker 已 join，则 fail-fast而不能冒险释放 owner。
 
 ## 第一版明确不支持
 

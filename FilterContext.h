@@ -22,11 +22,13 @@ struct FilterContext final
 {
     FilterContext(FilterGeneration value_generation, Filter::DomainBlocklist value)
         : generation(value_generation)
+        , normalized_rule_bytes(value.normalized_rule_bytes())
         , blocklist(std::move(value))
     {
     }
 
     FilterGeneration        generation{kInitialFilterGeneration};
+    size_t                  normalized_rule_bytes{0};
     Filter::DomainBlocklist blocklist;
 };
 

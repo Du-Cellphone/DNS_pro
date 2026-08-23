@@ -50,8 +50,14 @@ struct DNSTestPeer
     static void fail_coordinator_thread(DNS &service) noexcept { service.inject_coordinator_thread_failure_for_test(); }
     static void fail_coordinator_init(DNS &service) noexcept { service.inject_coordinator_init_failure_for_test(); }
     static void fail_coordinator_runtime(DNS &service) noexcept { service.inject_coordinator_runtime_failure_for_test(); }
+    static void fail_coordinator_after_commit(DNS &service) noexcept { service.inject_coordinator_postcommit_failure_for_test(); }
+    static void fail_reclaimer_thread(DNS &service) noexcept { service.inject_reclaimer_thread_failure_for_test(); }
+    static void fail_reclaimer_init(DNS &service) noexcept { service.inject_reclaimer_init_failure_for_test(); }
+    static void fail_reclaimer_runtime(DNS &service) noexcept { service.inject_reclaimer_runtime_failure_for_test(); }
+    static void fail_reclaimer_after_commit(DNS &service) noexcept { service.inject_reclaimer_postcommit_failure_for_test(); }
     static void fail_supervisor_thread(DNS &service) noexcept { service.inject_supervisor_thread_failure_for_test(); }
     static void fail_supervisor_runtime(DNS &service) noexcept { service.inject_supervisor_runtime_failure_for_test(); }
+    static void fail_supervisor_after_commit(DNS &service) noexcept { service.inject_supervisor_postcommit_failure_for_test(); }
 
     static void fail_worker_create(DNS &service, size_t worker_id, dns::server::WorkerInitStep step, int error_number) noexcept
     {
@@ -321,6 +327,25 @@ void test_typed_worker_thread_failure_after_partial_start()
 void test_typed_control_role_start_failures()
 {
     {
+        std::cerr << "  injecting reclaimer thread creation failure\n";
+        DNS service;
+        require(service.init(make_config()), "reclaimer-thread failure fixture must initialize");
+        DNSTestPeer::fail_reclaimer_thread(service);
+        const auto started = service.start();
+        require(!started && started.error().error_number == EAGAIN, "injected reclaimer thread failure must retain EAGAIN");
+        require_startup_failure_terminal(service, started, DNSStartErrorCode::ReclaimerThreadCreationFailed, DNSControlRole::SnapshotReclaimer,
+                                         "reclaimer thread creation failure must be typed and terminal");
+    }
+    {
+        std::cerr << "  injecting reclaimer Ready failure\n";
+        DNS service;
+        require(service.init(make_config()), "reclaimer-init failure fixture must initialize");
+        DNSTestPeer::fail_reclaimer_init(service);
+        const auto started = service.start();
+        require_startup_failure_terminal(service, started, DNSStartErrorCode::ReclaimerInitFailed, DNSControlRole::SnapshotReclaimer,
+                                         "reclaimer Ready failure must be typed and terminal");
+    }
+    {
         std::cerr << "  injecting coordinator thread creation failure\n";
         DNS service;
         require(service.init(make_config()), "coordinator-thread failure fixture must initialize");
@@ -540,6 +565,7 @@ void test_runtime_updates_disabled_do_not_start_coordinator()
     DNS service;
     require(service.init(make_config(1, false)), "disabled-update fixture must initialize");
     DNSTestPeer::fail_coordinator_thread(service);
+    DNSTestPeer::fail_reclaimer_thread(service);
 
     const auto started = service.start();
     require(static_cast<bool>(started), "a disabled coordinator must not consume its injected thread failure");
@@ -548,6 +574,18 @@ void test_runtime_updates_disabled_do_not_start_coordinator()
 
     service.request_stop();
     require(service.join().code == DNSServiceExitCode::ExplicitStop, "a service without coordinator A must still stop through supervisor C cleanly");
+}
+
+void test_reclaimer_runtime_fatal()
+{
+    DNS service;
+    require(service.init(make_config()), "reclaimer runtime-fatal fixture must initialize");
+    const auto started = service.start();
+    require(static_cast<bool>(started), "reclaimer runtime-fatal fixture must become Active");
+
+    DNSTestPeer::fail_reclaimer_runtime(service);
+    wait_for_fatal(service, DNSFatalCode::ReclaimerExited, DNSControlRole::SnapshotReclaimer,
+                   "an unexpected reclaimer exit must fail the service without dropping stable owners");
 }
 
 void test_coordinator_runtime_fatal()
@@ -575,6 +613,44 @@ void test_supervisor_runtime_fatal()
     DNSTestPeer::fail_supervisor_runtime(service);
     wait_for_fatal(service, DNSFatalCode::SupervisorExited, DNSControlRole::WorkerSupervisor,
                    "an unexpected supervisor exit must use the independent fatal-stop path");
+}
+
+void test_committed_update_survives_control_role_failures()
+{
+    const auto exercise = [](auto inject_failure, auto validate_fatal, std::string_view fixture_name)
+    {
+        DNS service;
+        require(service.init(make_config(2, true)), "committed-failure fixture must initialize");
+        require(static_cast<bool>(service.start()), "committed-failure fixture must become Active");
+        inject_failure(service);
+
+        std::optional<dns::server::FilterUpdateResult> update_result;
+        std::jthread updater{[&] { update_result.emplace(service.replace_blocked_domains({"survives-control-failure.example"})); }};
+
+        const auto exit = service.wait();
+        updater.join();
+        require(exit.code == DNSServiceExitCode::Fatal && exit.fatal_error && validate_fatal(*exit.fatal_error), fixture_name);
+        require(update_result && *update_result && update_result->value().generation == 2 && update_result->value().rule_count == 1,
+                "an update committed before a control-role failure must complete as success after its exact cohort converges");
+        require(service.filter_version() == std::optional{dns::server::FilterVersion{2, 1}},
+                "fatal teardown must retain the committed generation's coherent metadata");
+    };
+
+    exercise([](DNS &service) { DNSTestPeer::fail_coordinator_after_commit(service); }, [](const DNSFatalError &error)
+             { return error.code == DNSFatalCode::CoordinatorExited && error.role == DNSControlRole::FilterUpdateCoordinator; },
+             "a postcommit A failure must be classified as a coordinator fatal");
+
+    exercise([](DNS &service) { DNSTestPeer::fail_reclaimer_after_commit(service); },
+             [](const DNSFatalError &error)
+             {
+                 return (error.code == DNSFatalCode::ReclaimerExited && error.role == DNSControlRole::SnapshotReclaimer) ||
+                        (error.code == DNSFatalCode::CoordinatorExited && error.role == DNSControlRole::FilterUpdateCoordinator);
+             },
+             "a postcommit B failure must enter the fatal emergency-reclaimer path");
+
+    exercise([](DNS &service) { DNSTestPeer::fail_supervisor_after_commit(service); }, [](const DNSFatalError &error)
+             { return error.code == DNSFatalCode::SupervisorExited && error.role == DNSControlRole::WorkerSupervisor; },
+             "a postcommit C failure must be classified as a supervisor fatal");
 }
 
 void test_explicit_stop_and_runtime_fatal_are_first_wins()
@@ -628,7 +704,7 @@ void test_explicit_stop_and_runtime_fatal_are_first_wins()
     }
 }
 
-void test_restart_configuration_still_fails_service_in_stage_twelve()
+void test_restart_configuration_still_fails_service_in_stage_thirteen()
 {
     DNS       service;
     DNSConfig config                = make_config(1, false);
@@ -646,7 +722,7 @@ void test_restart_configuration_still_fails_service_in_stage_twelve()
                                      "an unsolicited RequestedStop must be normalized into a worker fatal");
     require(exit.fatal_error->worker_id == 0 && exit.fatal_error->instance_id == 1,
             "the worker fatal must identify the exact logical worker instance");
-    require(service.health().restart_count == 0, "stage 12 must store Restart configuration without actually launching a replacement worker");
+    require(service.health().restart_count == 0, "stage 13 must store Restart configuration without actually launching a replacement worker");
 }
 
 } // namespace
@@ -678,9 +754,11 @@ int main()
     run("TeardownIncomplete retains owners", test_teardown_incomplete_retains_owners_and_can_retry);
     run("runtime updates disabled", test_runtime_updates_disabled_do_not_start_coordinator);
     run("coordinator runtime fatal", test_coordinator_runtime_fatal);
+    run("reclaimer runtime fatal", test_reclaimer_runtime_fatal);
     run("supervisor runtime fatal", test_supervisor_runtime_fatal);
+    run("committed update survives A/B/C failures", test_committed_update_survives_control_role_failures);
     run("explicit stop and runtime fatal are first-wins", test_explicit_stop_and_runtime_fatal_are_first_wins);
-    run("Restart policy remains fail-service", test_restart_configuration_still_fails_service_in_stage_twelve);
+    run("Restart policy remains fail-service", test_restart_configuration_still_fails_service_in_stage_thirteen);
     std::cout << "all lifecycle tests passed\n";
     return EXIT_SUCCESS;
 }

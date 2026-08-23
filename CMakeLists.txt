@@ -10,8 +10,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(DNS_PRO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer (legacy combined switch)" OFF)
 option(DNS_PRO_ENABLE_ADDRESS_SANITIZER "Enable AddressSanitizer" OFF)
 option(DNS_PRO_ENABLE_UNDEFINED_BEHAVIOR_SANITIZER "Enable UndefinedBehaviorSanitizer" OFF)
+option(DNS_PRO_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
 option(DNS_PRO_REQUIRE_SOCKET_TESTS "Fail socket test executables instead of explicitly skipping when socket I/O is unavailable" OFF)
 option(DNS_PRO_BUILD_FUZZERS "Build Clang/libFuzzer protocol targets" OFF)
+
+if(DNS_PRO_ENABLE_THREAD_SANITIZER AND (DNS_PRO_ENABLE_SANITIZERS OR DNS_PRO_ENABLE_ADDRESS_SANITIZER))
+    message(FATAL_ERROR "ThreadSanitizer cannot be combined with AddressSanitizer")
+endif()
+if(DNS_PRO_ENABLE_THREAD_SANITIZER AND DNS_PRO_BUILD_FUZZERS)
+    message(FATAL_ERROR "ThreadSanitizer cannot be combined with DNS_PRO_BUILD_FUZZERS because the fuzz targets use AddressSanitizer")
+endif()
 
 set(DNS_PRO_SANITIZER_LIST)
 if(DNS_PRO_ENABLE_SANITIZERS OR DNS_PRO_ENABLE_ADDRESS_SANITIZER)
@@ -19,6 +27,9 @@ if(DNS_PRO_ENABLE_SANITIZERS OR DNS_PRO_ENABLE_ADDRESS_SANITIZER)
 endif()
 if(DNS_PRO_ENABLE_SANITIZERS OR DNS_PRO_ENABLE_UNDEFINED_BEHAVIOR_SANITIZER)
     list(APPEND DNS_PRO_SANITIZER_LIST undefined)
+endif()
+if(DNS_PRO_ENABLE_THREAD_SANITIZER)
+    list(APPEND DNS_PRO_SANITIZER_LIST thread)
 endif()
 
 if(DNS_PRO_SANITIZER_LIST AND NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -82,6 +93,7 @@ add_library(dns_core STATIC
     CuckooFilter.cpp
     DomainBlocklist.cpp
     FilterContext.cpp
+    FilterPublication.cpp
     FilterUpdateController.cpp
     protocol/DnsParser.cpp
     protocol/DnsQuery.cpp
@@ -145,6 +157,13 @@ if(BUILD_TESTING)
     dns_pro_enable_sanitizers(dns_filter_reload_tests)
     add_test(NAME dns_filter_reload_tests COMMAND dns_filter_reload_tests)
     set_tests_properties(dns_filter_reload_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(dns_generation_tests tests/generation_tests.cpp)
+    target_link_libraries(dns_generation_tests PRIVATE dns_core)
+    dns_pro_set_warnings(dns_generation_tests)
+    dns_pro_enable_sanitizers(dns_generation_tests)
+    add_test(NAME dns_generation_tests COMMAND dns_generation_tests)
+    set_tests_properties(dns_generation_tests PROPERTIES TIMEOUT 20)
 
     add_executable(dns_cache_tests tests/cache_tests.cpp)
     target_link_libraries(dns_cache_tests PRIVATE dns_core)

@@ -39,12 +39,14 @@ public:
     DomainBlocklist(const DomainBlocklist &)                = delete;
     DomainBlocklist &operator=(const DomainBlocklist &)     = delete;
 
-    static std::expected<DomainBlocklist, BlocklistBuildError> build(std::span<const std::string> rules,
-                                                                     std::stop_token                stop_token = {});
+    static std::expected<DomainBlocklist, BlocklistBuildError> build(std::span<const std::string> rules, std::stop_token stop_token = {});
 
     [[nodiscard]] bool   matches(const dns::protocol::DomainName &query) const noexcept;
     [[nodiscard]] bool   matches(std::string_view query) const;
     [[nodiscard]] size_t rule_count() const noexcept { return rule_count_; }
+    // Sum of canonical wire-key bytes for unique compiled rules. This is an
+    // accounted input-size metric, not a claim about allocator/RSS usage.
+    [[nodiscard]] size_t normalized_rule_bytes() const noexcept { return normalized_rule_bytes_; }
 
 private:
     explicit DomainBlocklist(size_t bucket_count);
@@ -52,6 +54,7 @@ private:
     CuckooFilter prefilter_;
     RadixTree    tree_;
     size_t       rule_count_{0};
+    size_t       normalized_rule_bytes_{0};
 };
 
 } // namespace Filter

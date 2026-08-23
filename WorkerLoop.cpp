@@ -106,7 +106,7 @@ DatagramDecision WorkerLoop::evaluate_datagram(std::span<const std::byte> packet
 
 WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config)
 {
-    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, nullptr}};
+    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard}};
     auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
         return std::unexpected(initialized.error());
@@ -114,9 +114,11 @@ WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cac
 }
 
 WorkerLoop::CreateResult WorkerLoop::create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard,
-                                            const FilterSnapshotSlot &filter_snapshots, const UpstreamConfig &upstream_config)
+                                            FilterPublicationState &filter_publication, FilterSnapshot initial_snapshot, WorkerEpoch &epoch,
+                                            uint64_t instance_id, const UpstreamConfig &upstream_config)
 {
-    auto worker      = std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, &filter_snapshots}};
+    auto worker =
+        std::unique_ptr<WorkerLoop>{new WorkerLoop{worker_id, cache_shard, &filter_publication, std::move(initial_snapshot), &epoch, instance_id}};
     auto initialized = worker->initialize(port, upstream_config);
     if (!initialized)
         return std::unexpected(initialized.error());
@@ -153,6 +155,14 @@ std::expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const
     if (!wake)
         return init_failure(WorkerInitStep::CreateWakeEvent);
 
+    runtime::UniqueFd generation;
+    if (filter_publication_ != nullptr)
+    {
+        generation.reset(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+        if (!generation)
+            return init_failure(WorkerInitStep::CreateGenerationEvent);
+    }
+
     if (!is_valid_upstream_config(upstream_config))
     {
         errno = EINVAL;
@@ -182,6 +192,15 @@ std::expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const
     if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, wake.get(), &wake_event) < 0)
         return init_failure(WorkerInitStep::RegisterWakeEvent);
 
+    if (generation)
+    {
+        epoll_event generation_event{};
+        generation_event.events   = EPOLLIN;
+        generation_event.data.u64 = static_cast<uint64_t>(EventKind::Generation);
+        if (::epoll_ctl(epoll.get(), EPOLL_CTL_ADD, generation.get(), &generation_event) < 0)
+            return init_failure(WorkerInitStep::RegisterGenerationEvent);
+    }
+
     epoll_event upstream_event{};
     upstream_event.events   = EPOLLIN | EPOLLET;
     upstream_event.data.u64 = static_cast<uint64_t>(EventKind::Upstream);
@@ -198,6 +217,7 @@ std::expected<void, WorkerInitError> WorkerLoop::initialize(uint16_t port, const
     listen_fd_                                       = std::move(listener);
     epoll_fd_                                        = std::move(epoll);
     wake_fd_                                         = std::move(wake);
+    generation_fd_                                   = std::move(generation);
     upstream_fd_                                     = std::move(upstream_socket);
     upstream_channel_config_.query_timeout           = upstream_config.query_timeout;
     upstream_channel_config_.id_reuse_guard          = upstream_config.id_reuse_guard;
@@ -253,30 +273,71 @@ WorkerRunResult WorkerLoop::run(std::stop_token thread_stop_token, WorkerRunObse
         }
         else
         {
-            if (observer != nullptr)
+            if (filter_publication_ != nullptr && !refresh_filter_snapshot())
             {
+                result.emplace(fatal_exit(WorkerRuntimeStep::SynchronizeFilter));
+                if (observer != nullptr)
+                {
+                    observer->report_ready(init_error(WorkerRuntimeStep::SynchronizeFilter));
+                    ready_reported = true;
+                }
+            }
+            else if (observer != nullptr)
+            {
+                observer->report_filter_progress();
                 observer->report_ready(WorkerReadyResult{WorkerReadyOutcome::Ready, std::nullopt});
                 ready_reported = true;
 
-                const bool activate = observer->await_activation(stop_token);
-                if (!activate)
+                while (!result)
                 {
-                    result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::AwaitActivation));
-                }
-                else if (stop_token.stop_requested())
-                {
-                    result.emplace(requested_stop());
-                }
-                else
-                {
-                    observer->report_activated();
-                    const bool enter_data_plane = observer->await_data_plane(stop_token);
-                    if (!enter_data_plane)
+                    const auto action = observer->await_activation(stop_token);
+                    if (action == WorkerRunObserver::GateAction::RefreshFilter)
+                    {
+                        if (!refresh_filter_snapshot())
+                        {
+                            result.emplace(fatal_exit(WorkerRuntimeStep::SynchronizeFilter));
+                            break;
+                        }
+                        observer->report_filter_progress();
+                        continue;
+                    }
+                    if (action == WorkerRunObserver::GateAction::Stop)
+                    {
                         result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::AwaitActivation));
-                    else if (stop_token.stop_requested())
+                        break;
+                    }
+                    if (stop_token.stop_requested())
+                    {
                         result.emplace(requested_stop());
-                    else
-                        activated = true;
+                        break;
+                    }
+
+                    observer->report_activated();
+                    while (!result)
+                    {
+                        const auto data_action = observer->await_data_plane(stop_token);
+                        if (data_action == WorkerRunObserver::GateAction::RefreshFilter)
+                        {
+                            if (!refresh_filter_snapshot())
+                            {
+                                result.emplace(fatal_exit(WorkerRuntimeStep::SynchronizeFilter));
+                                break;
+                            }
+                            observer->report_filter_progress();
+                            continue;
+                        }
+                        if (data_action == WorkerRunObserver::GateAction::Stop)
+                        {
+                            result.emplace(stop_token.stop_requested() ? requested_stop() : fatal_exit(WorkerRuntimeStep::AwaitActivation));
+                            break;
+                        }
+                        if (stop_token.stop_requested())
+                            result.emplace(requested_stop());
+                        else
+                            activated = true;
+                        break;
+                    }
+                    break;
                 }
             }
             else if (stop_token.stop_requested())
@@ -314,6 +375,12 @@ WorkerRunResult WorkerLoop::run(std::stop_token thread_stop_token, WorkerRunObse
                             drain_wakeup();
                             continue;
                         }
+                        if (kind == EventKind::Generation)
+                        {
+                            drain_generation_wakeup();
+                            generation_pending_ = true;
+                            continue;
+                        }
                         if (kind == EventKind::Listener)
                             listener_pending_ = true;
                         if (kind == EventKind::Upstream)
@@ -327,6 +394,17 @@ WorkerRunResult WorkerLoop::run(std::stop_token thread_stop_token, WorkerRunObse
 
                     if (stop_token.stop_requested())
                         break;
+                    if (generation_pending_)
+                    {
+                        generation_pending_ = false;
+                        if (!refresh_filter_snapshot())
+                        {
+                            result.emplace(fatal_exit(WorkerRuntimeStep::SynchronizeFilter));
+                            break;
+                        }
+                        if (observer != nullptr)
+                            observer->report_filter_progress();
+                    }
                     if (listener_pending_)
                         drain_listener(stop_token);
                     if (upstream_pending_)
@@ -453,12 +531,52 @@ void WorkerLoop::request_stop() const noexcept
     } while (result < 0 && errno == EINTR);
 }
 
+bool WorkerLoop::request_filter_refresh() const noexcept
+{
+    if (!generation_fd_)
+        return false;
+
+    const uint64_t value = 1;
+    ssize_t        result;
+    do
+    {
+        result = ::write(generation_fd_.get(), &value, sizeof(value));
+    } while (result < 0 && errno == EINTR);
+    // EAGAIN means the eventfd counter is already readable; the outstanding
+    // wake therefore still covers the latest published generation.
+    return result == static_cast<ssize_t>(sizeof(value)) || (result < 0 && errno == EAGAIN);
+}
+
 void WorkerLoop::drain_wakeup() const noexcept
 {
     uint64_t value{0};
     while (::read(wake_fd_.get(), &value, sizeof(value)) < 0 && errno == EINTR)
     {
     }
+}
+
+void WorkerLoop::drain_generation_wakeup() const noexcept
+{
+    uint64_t value{0};
+    while (::read(generation_fd_.get(), &value, sizeof(value)) < 0 && errno == EINTR)
+    {
+    }
+}
+
+bool WorkerLoop::refresh_filter_snapshot() noexcept
+{
+    if (filter_publication_ == nullptr)
+        return true;
+    if (epoch_ == nullptr || instance_id_ == 0)
+        return false;
+    return filter_publication_->refresh_worker_snapshot(local_filter_snapshot_, instance_id_, *epoch_);
+}
+
+bool WorkerLoop::matches_filter(const protocol::DomainName &name) const noexcept
+{
+    // This helper is deliberately synchronous and only returns a value. No
+    // tree node/reference can escape across the later upstream co_await.
+    return local_filter_snapshot_ && local_filter_snapshot_->blocklist.matches(name);
 }
 
 void WorkerLoop::drain_listener(std::stop_token stop_token) noexcept
@@ -557,21 +675,17 @@ runtime::Task<void> WorkerLoop::process_datagram(ClientDatagram datagram)
             }
 
             const protocol::Question &question = decision.request->questions.front();
-            if (filter_snapshots_ != nullptr)
+            if (matches_filter(question.name))
             {
-                const FilterSnapshot snapshot = filter_snapshots_->load(std::memory_order_acquire);
-                if (snapshot && snapshot->blocklist.matches(question.name))
+                ++stats_.blocked_queries;
+                auto refused =
+                    protocol::make_error_response(*decision.request, protocol::ResponseCode::Refused, true, protocol::kDownstreamResponseBudget);
+                if (!refused)
                 {
-                    ++stats_.blocked_queries;
-                    auto refused =
-                        protocol::make_error_response(*decision.request, protocol::ResponseCode::Refused, true, protocol::kDownstreamResponseBudget);
-                    if (!refused)
-                    {
-                        ++stats_.internal_errors;
-                        co_return;
-                    }
-                    decision.response = std::move(*refused);
+                    ++stats_.internal_errors;
+                    co_return;
                 }
+                decision.response = std::move(*refused);
             }
 
             if (decision.response.empty())

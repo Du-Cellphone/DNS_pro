@@ -1,7 +1,7 @@
 #pragma once
 
 #include "DNS_Cache.h"
-#include "FilterContext.h"
+#include "FilterPublication.h"
 #include "common/Expected.h"
 #include "protocol/DnsMessage.h"
 #include "runtime/Scheduler.h"
@@ -19,6 +19,7 @@
 #include <stop_token>
 #include <string>
 #include <sys/socket.h>
+#include <utility>
 #include <vector>
 
 namespace dns::server
@@ -46,11 +47,13 @@ enum class WorkerInitStep
     ReadBoundAddress,
     CreateEpoll,
     CreateWakeEvent,
+    CreateGenerationEvent,
     ValidateUpstream,
     CreateUpstreamSocket,
     ConnectUpstream,
     RegisterListener,
     RegisterWakeEvent,
+    RegisterGenerationEvent,
     RegisterUpstream,
 };
 
@@ -68,6 +71,7 @@ enum class WorkerRuntimeStep : uint8_t
     StartTimerQueue,
     StartUpstreamChannel,
     AwaitActivation,
+    SynchronizeFilter,
     WaitForEvents,
     RuntimeInvariant,
     UnhandledException,
@@ -118,10 +122,18 @@ class WorkerRunObserver
 public:
     virtual ~WorkerRunObserver() = default;
 
-    virtual void               report_ready(WorkerReadyResult result) noexcept       = 0;
-    [[nodiscard]] virtual bool await_activation(std::stop_token stop_token) noexcept = 0;
-    virtual void               report_activated() noexcept                           = 0;
-    [[nodiscard]] virtual bool await_data_plane(std::stop_token stop_token) noexcept = 0;
+    enum class GateAction : uint8_t
+    {
+        Stop,
+        RefreshFilter,
+        Proceed,
+    };
+
+    virtual void                     report_ready(WorkerReadyResult result) noexcept       = 0;
+    [[nodiscard]] virtual GateAction await_activation(std::stop_token stop_token) noexcept = 0;
+    virtual void                     report_activated() noexcept                           = 0;
+    [[nodiscard]] virtual GateAction await_data_plane(std::stop_token stop_token) noexcept = 0;
+    virtual void                     report_filter_progress() noexcept                     = 0;
 };
 
 struct WorkerStats
@@ -174,8 +186,8 @@ public:
     using CreateResult = std::expected<std::unique_ptr<WorkerLoop>, WorkerInitError>;
 
     static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const UpstreamConfig &upstream_config = {});
-    static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, const FilterSnapshotSlot &filter_snapshots,
-                                   const UpstreamConfig &upstream_config = {});
+    static CreateResult     create(size_t worker_id, uint16_t port, Cache::CacheShard &cache_shard, FilterPublicationState &filter_publication,
+                                   FilterSnapshot initial_snapshot, WorkerEpoch &epoch, uint64_t instance_id, const UpstreamConfig &upstream_config = {});
     static DatagramDecision evaluate_datagram(std::span<const std::byte> packet, bool truncated);
 
     WorkerLoop(const WorkerLoop &)            = delete;
@@ -185,6 +197,7 @@ public:
     // initialization succeeds, the worker is activated immediately.
     [[nodiscard]] WorkerRunResult run(std::stop_token stop_token, WorkerRunObserver *observer = nullptr) noexcept;
     void                          request_stop() const noexcept;
+    [[nodiscard]] bool            request_filter_refresh() const noexcept;
 
     [[nodiscard]] size_t             worker_id() const noexcept { return worker_id_; }
     [[nodiscard]] uint16_t           bound_port() const noexcept { return bound_port_; }
@@ -195,9 +208,10 @@ private:
 
     enum class EventKind : uint64_t
     {
-        Listener = 1,
-        Wake     = 2,
-        Upstream = 3,
+        Listener   = 1,
+        Wake       = 2,
+        Upstream   = 3,
+        Generation = 4,
     };
 
     struct ClientDatagram
@@ -214,10 +228,14 @@ private:
     static constexpr size_t kReadyBudget           = 64;
     static constexpr size_t kShutdownResumeBudget  = 4096;
 
-    WorkerLoop(size_t worker_id, Cache::CacheShard &cache_shard, const FilterSnapshotSlot *filter_snapshots)
+    WorkerLoop(size_t worker_id, Cache::CacheShard &cache_shard, FilterPublicationState *filter_publication = nullptr,
+               FilterSnapshot initial_snapshot = {}, WorkerEpoch *epoch = nullptr, uint64_t instance_id = 0)
         : worker_id_(worker_id)
         , cache_shard_(cache_shard)
-        , filter_snapshots_(filter_snapshots)
+        , filter_publication_(filter_publication)
+        , local_filter_snapshot_(std::move(initial_snapshot))
+        , epoch_(epoch)
+        , instance_id_(instance_id)
     {
     }
 
@@ -226,6 +244,9 @@ private:
     void                                 capture_runtime_stats() noexcept;
     [[nodiscard]] bool                   runtime_invariants_hold() const noexcept;
     void                                 drain_wakeup() const noexcept;
+    void                                 drain_generation_wakeup() const noexcept;
+    [[nodiscard]] bool                   refresh_filter_snapshot() noexcept;
+    [[nodiscard]] bool                   matches_filter(const protocol::DomainName &name) const noexcept;
     void                                 drain_listener(std::stop_token stop_token) noexcept;
     runtime::Task<void>                  process_datagram(ClientDatagram datagram);
     void send_response(const std::vector<std::byte> &response, const sockaddr *client_address, socklen_t client_length) noexcept;
@@ -233,10 +254,14 @@ private:
     size_t                         worker_id_{0};
     uint16_t                       bound_port_{0};
     Cache::CacheShard             &cache_shard_;
-    const FilterSnapshotSlot      *filter_snapshots_{nullptr};
+    FilterPublicationState        *filter_publication_{nullptr};
+    FilterSnapshot                 local_filter_snapshot_;
+    WorkerEpoch                   *epoch_{nullptr};
+    uint64_t                       instance_id_{0};
     runtime::UniqueFd              listen_fd_;
     runtime::UniqueFd              epoll_fd_;
     runtime::UniqueFd              wake_fd_;
+    runtime::UniqueFd              generation_fd_;
     runtime::UniqueFd              upstream_fd_;
     dns::upstream::UpstreamChannel upstream_channel_;
     // UpstreamChannel and TimerQueue borrow nodes from coroutine frames. Both
@@ -247,6 +272,7 @@ private:
     WorkerStats                  stats_;
     mutable std::stop_source     stop_source_;
     bool                         listener_pending_{false};
+    bool                         generation_pending_{false};
     bool                         upstream_pending_{false};
     bool                         upstream_error_pending_{false};
     bool                         upstream_hangup_pending_{false};

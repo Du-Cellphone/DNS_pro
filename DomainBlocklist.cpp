@@ -39,8 +39,7 @@ DomainBlocklist::DomainBlocklist(size_t bucket_count)
 {
 }
 
-std::expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules,
-                                                                          std::stop_token                stop_token)
+std::expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::span<const std::string> rules, std::stop_token stop_token)
 {
     if (stop_token.stop_requested())
         return std::unexpected(BlocklistBuildError{BlocklistBuildErrorCode::Cancelled, 0});
@@ -97,6 +96,8 @@ std::expected<DomainBlocklist, BlocklistBuildError> DomainBlocklist::build(std::
                 candidate.tree_.insert(canonical_rules[index]);
             }
             candidate.rule_count_ = canonical_rules.size();
+            for (const auto &rule : canonical_rules)
+                candidate.normalized_rule_bytes_ += rule.canonical_key().size();
             return candidate;
         }
 

@@ -46,6 +46,14 @@
       }
     },
     {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer",
+      "inherits": "base",
+      "cacheVariables": {
+        "DNS_PRO_ENABLE_THREAD_SANITIZER": "ON"
+      }
+    },
+    {
       "name": "fuzz",
       "displayName": "Clang libFuzzer targets",
       "inherits": "base",
@@ -72,6 +80,10 @@
     {
       "name": "ubsan",
       "configurePreset": "ubsan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
     },
     {
       "name": "fuzz",
@@ -112,6 +124,16 @@
       "configurePreset": "ubsan",
       "environment": {
         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7"
       },
       "output": {
         "outputOnFailure": true

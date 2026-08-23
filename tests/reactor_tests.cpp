@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -837,6 +838,69 @@ void test_filter_snapshot_precedes_an_existing_cache_entry()
     require(restored && restored->header.id == 0x3005 &&
                 restored->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) && restored->answers.size() == 2,
             "clearing the filter must expose the existing positive cache entry without another upstream query");
+
+    std::atomic<bool>   load_started{false};
+    std::atomic<bool>   load_stop{false};
+    std::atomic<bool>   load_failed{false};
+    std::atomic<size_t> load_queries{0};
+    std::jthread        query_load{
+        [&]
+        {
+            dns::runtime::UniqueFd load_client{::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+            if (!load_client || ::setsockopt(load_client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+            {
+                load_failed.store(true, std::memory_order_release);
+                load_started.store(true, std::memory_order_release);
+                return;
+            }
+            load_started.store(true, std::memory_order_release);
+            uint16_t id = 0x6000;
+            while (!load_stop.load(std::memory_order_acquire))
+            {
+                auto       wire     = exchange(load_client.get(), *port, make_query(id, dns::protocol::RecordType::A, "www.blocked.example"),
+                                                      "continuous query during filter publication");
+                auto       response = dns::protocol::parse_message(wire);
+                const bool refused = response && response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::Refused) &&
+                                     response->answers.empty();
+                const bool cached = response && response->header.response_code == static_cast<uint8_t>(dns::protocol::ResponseCode::NoError) &&
+                                    response->answers.size() == 2;
+                if (!response || response->header.id != id || (!refused && !cached))
+                {
+                    load_failed.store(true, std::memory_order_release);
+                    break;
+                }
+                load_queries.fetch_add(1, std::memory_order_relaxed);
+                ++id;
+            }
+        }};
+    while (!load_started.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    require(!load_failed.load(std::memory_order_acquire), "continuous-query client must initialize");
+
+    constexpr size_t stress_updates = 64;
+    for (size_t index = 0; index < stress_updates; ++index)
+    {
+        const bool blocked = index % 2 == 0;
+        auto stress_update = service.replace_blocked_domains(blocked ? std::vector<std::string>{"blocked.example"} : std::vector<std::string>{});
+        require(stress_update && stress_update->generation == static_cast<dns::server::FilterGeneration>(5 + index) &&
+                    stress_update->rule_count == static_cast<size_t>(blocked),
+                "stress publications must remain consecutive and report coherent metadata");
+
+        const uint16_t id = static_cast<uint16_t>(0x5000 + index);
+        auto           postcommit_wire =
+            exchange(client.get(), *port, make_query(id, dns::protocol::RecordType::A, "www.blocked.example"), "postcommit filter behavior");
+        auto postcommit = dns::protocol::parse_message(postcommit_wire);
+        require(postcommit && postcommit->header.id == id &&
+                    postcommit->header.response_code ==
+                        static_cast<uint8_t>(blocked ? dns::protocol::ResponseCode::Refused : dns::protocol::ResponseCode::NoError) &&
+                    (blocked ? postcommit->answers.empty() : postcommit->answers.size() == 2),
+                "a query sent after update success must observe the newly committed complete rule set");
+    }
+
+    load_stop.store(true, std::memory_order_release);
+    query_load.join();
+    require(!load_failed.load(std::memory_order_acquire) && load_queries.load(std::memory_order_relaxed) != 0,
+            "continuous queries must see only complete old/new filter behavior throughout repeated publications");
 
     std::array<std::byte, 64> unexpected_upstream{};
     errno = 0;

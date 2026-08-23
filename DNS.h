@@ -36,7 +36,7 @@ struct DNSConfig
     uint16_t port{5353};
     bool     runtime_updates_enabled{true};
 
-    // Stage 12 stores the recovery policy, but every runtime worker failure
+    // Stage 13 stores the recovery policy, but every runtime worker failure
     // still fails the complete service. Restart is activated in stage 14.
     WorkerFailurePolicy       worker_failure_policy{WorkerFailurePolicy::FailService};
     size_t                    restart_max_attempts{3};
@@ -72,6 +72,7 @@ enum class DNSControlRole
 {
     None,
     FilterUpdateCoordinator,
+    SnapshotReclaimer,
     WorkerSupervisor,
     Worker,
 };
@@ -82,6 +83,8 @@ enum class DNSStartErrorCode
     Cancelled,
     CoordinatorThreadCreationFailed,
     CoordinatorInitFailed,
+    ReclaimerThreadCreationFailed,
+    ReclaimerInitFailed,
     SupervisorThreadCreationFailed,
     SupervisorInitFailed,
     WorkerCreateFailed,
@@ -127,6 +130,8 @@ enum class DNSFatalCode
 {
     None,
     CoordinatorExited,
+    ReclaimerExited,
+    GracePeriodStalled,
     SupervisorExited,
     WorkerExited,
     UnexpectedWorkerStop,
@@ -135,13 +140,19 @@ enum class DNSFatalCode
 
 struct DNSFatalError
 {
-    DNSFatalCode                                   code{DNSFatalCode::None};
-    DNSControlRole                                 role{DNSControlRole::None};
-    size_t                                         worker_id{std::numeric_limits<size_t>::max()};
-    uint64_t                                       instance_id{0};
-    std::optional<dns::server::WorkerRuntimeError> worker_error;
+    DNSFatalCode                                              code{DNSFatalCode::None};
+    DNSControlRole                                            role{DNSControlRole::None};
+    size_t                                                    worker_id{std::numeric_limits<size_t>::max()};
+    uint64_t                                                  instance_id{0};
+    std::optional<dns::server::WorkerRuntimeError>            worker_error;
+    std::shared_ptr<const dns::server::FilterGraceDiagnostic> grace_diagnostic;
 
-    bool operator==(const DNSFatalError &) const = default;
+    bool operator==(const DNSFatalError &other) const
+    {
+        return code == other.code && role == other.role && worker_id == other.worker_id && instance_id == other.instance_id &&
+               worker_error == other.worker_error && static_cast<bool>(grace_diagnostic) == static_cast<bool>(other.grace_diagnostic) &&
+               (!grace_diagnostic || *grace_diagnostic == *other.grace_diagnostic);
+    }
 };
 
 struct DNSServiceExitResult
@@ -221,6 +232,7 @@ private:
     struct FaultInjection;
 
     void                               coordinator_main(std::stop_token stop_token, uint64_t attempt_id) noexcept;
+    void                               reclaimer_main(std::stop_token stop_token, uint64_t attempt_id) noexcept;
     void                               supervisor_main(std::stop_token stop_token, uint64_t attempt_id) noexcept;
     [[nodiscard]] bool                 accept_fatal_locked(DNSFatalError error) noexcept;
     void                               fail_service(DNSFatalError error) noexcept;
@@ -233,8 +245,14 @@ private:
     void               inject_coordinator_thread_failure_for_test() noexcept;
     void               inject_coordinator_init_failure_for_test() noexcept;
     void               inject_coordinator_runtime_failure_for_test() noexcept;
+    void               inject_coordinator_postcommit_failure_for_test() noexcept;
+    void               inject_reclaimer_thread_failure_for_test() noexcept;
+    void               inject_reclaimer_init_failure_for_test() noexcept;
+    void               inject_reclaimer_runtime_failure_for_test() noexcept;
+    void               inject_reclaimer_postcommit_failure_for_test() noexcept;
     void               inject_supervisor_thread_failure_for_test() noexcept;
     void               inject_supervisor_runtime_failure_for_test() noexcept;
+    void               inject_supervisor_postcommit_failure_for_test() noexcept;
     void               inject_worker_create_failure_for_test(size_t worker_id, dns::server::WorkerInitStep step, int error_number) noexcept;
     void               inject_worker_runtime_init_failure_for_test(size_t worker_id) noexcept;
     void               inject_worker_thread_failure_for_test(size_t worker_id) noexcept;
@@ -266,5 +284,6 @@ private:
     std::unique_ptr<Cache::DNS_Cache>                    cache_;
     std::unique_ptr<dns::server::WorkerSupervisor>       supervisor_;
     std::jthread                                         coordinator_thread_;
+    std::jthread                                         reclaimer_thread_;
     std::jthread                                         supervisor_thread_;
 };

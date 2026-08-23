@@ -2,7 +2,7 @@
 
 本文档从阶段 10 完成后的代码状态出发，统一记录已经确认的产品边界、控制面架构、快照生命周期、worker 恢复语义和后续实施顺序。后续若改变这里的协议或生命周期契约，必须在同一阶段同步修改本文档、`docs/MVP_SCOPE.md` 和对应测试。
 
-当前实施状态：阶段 12 的真实生命周期、A/C 启动握手、稳定 `WorkerRecord`、双门数据面激活和结构化故障结果已经完成，default、严格 socket、ASan、UBSan 四套构建与全部 11 个 CTest 目标均通过，下一阶段为阶段 13。本地环境仍缺少 `clang++` 和 `dig`，因此 libFuzzer target 的实际构建运行及 `dig +noedns` 手工验收须在具备这些工具的 CI/主机补跑；等价的通用 parser/service-boundary target、raw OPT 首包和 A/AAAA UDP 转发回归已经纳入代码库。
+当前实施状态：阶段 13 的 worker-local snapshot、generation 安全点、精确 publication cohort、一个普通 retirement credit、独立 terminal record、专用回收线程 B 以及 A/B/C 正常/故障停机协议已经完成，下一阶段为阶段 14 的可配置 worker 恢复与 degraded 健康状态。规则输入现在有 100,000 条/16 MiB 单命令硬上限、64 MiB 排队字节上限，grace stall 默认 30 秒且只触发诊断性 fatal、绝不强制回收。本地默认/严格 socket、ASan 和 UBSan 矩阵已覆盖 12 个 CTest target；TSan target 可以构建，但该宿主直接启动 GCC TSan 时会在进入测试逻辑前报 `unexpected memory mapping`。使用 `setarch x86_64 -R` 后，generation、filter-reload、lifecycle 和含持续 UDP 查询的 reactor 测试均已通过且无 TSan 报告；完整 preset 仍应在原生兼容的 CI 地址空间复跑。本地仍缺少 `clang++` 和 `dig`，因此 libFuzzer target 的实际构建运行及 `dig +noedns` 手工验收也须在具备这些工具的 CI/主机补跑；等价的通用 parser/service-boundary target、raw OPT 首包和 A/AAAA UDP 转发回归已经纳入代码库。
 
 ## 1. 已确认的决策
 
@@ -45,7 +45,7 @@ inline constexpr auto kDownstreamResponseBudget    = kClassicDnsUdpPayloadLimit;
 
 1. 启动是 all-or-nothing。只要任一 worker 或必需的控制面线程初始化失败，`DNS::start()` 就回滚整个启动尝试并返回结构化错误。
 2. DNS 库本身不调用 `std::exit()`；可执行程序的 `main` 收到启动失败后打印原因并以非零状态退出。这满足“启动期任一 worker 失败即退出程序”，又保持库 API 可测试。
-3. worker 自动恢复只适用于服务已经进入 `Active` 后发生的运行期 fatal exit，并由显式配置决定。阶段 12 先以 `FailService` 作为唯一实际行为；阶段 14 才启用可选的 `Restart`：
+3. worker 自动恢复只适用于服务已经进入 `Active` 后发生的运行期 fatal exit，并由显式配置决定。阶段 12/13 以 `FailService` 作为唯一实际行为；阶段 14 才启用可选的 `Restart`：
 
 ```text
 worker_failure_policy = Restart | FailService
@@ -95,7 +95,7 @@ A、B、C 任一线程在运行期意外退出都属于服务级 fatal error。�
 
 1. 将 active snapshot 的原子 exchange 定义为不可逆的 commit point。
 2. commit 前构建失败、取消或 shutdown：旧快照和 generation 完全不变，命令返回明确错误。
-3. commit 后命令不能再返回 `Cancelled` 或声称回滚。它等待本次发布捕获的精确参与者集合完成切换；即使此时开始 shutdown，只要这些参与者已经 ack，或已 join、释放本地快照并注销，就返回成功。
+3. commit 后命令不能再返回 `Cancelled` 或声称回滚。它等待本次发布捕获的精确参与者集合完成切换；即使此时开始 shutdown，只要这些参与者已经 ack，或已 join、释放本地快照并注销，就返回成功。B 先发布 cohort convergence 供 A/successor 完成 future，再在 B 线程析构 sole old owner；retirement credit 直到析构结束才归还，因此 API 成功不承担大树析构尾延迟，下一次重型构建仍受单 credit 背压。
 4. 每次 commit 前必须预留 retirement record、队列空间和字节预算；exchange 之后的入队、通知和状态更新必须是预分配且 `noexcept` 的，避免“已发布但无法登记旧树”。
 5. `max_unreclaimed_generations=1`。只有 B 回收上一棵 retired 快照、归还 retirement credit 后，A 才能开始下一次重型构建/发布。更新命令队列仍有固定上限，但不能靠无界候选树占用内存。
 6. grace-period 超时只用于诊断和触发 `FailService`，绝不能授权删除旧树。诊断至少包含 generation、未完成的 `(worker_id, instance_id)`、各自 observed generation、等待时长和 retired bytes。
@@ -420,32 +420,32 @@ AND retry budget is not exhausted
 3. 关闭 update admission，取消尚未 commit 的构建，通知 A seal publication；此时不能先 join A；
 4. 等待 A 确认 publication 已封口，不会再 commit 新 generation；seal ack 不等待已经 committed 的 future/cohort，否则会重新形成 A→B→worker 的循环等待；
 5. C 请求全部 worker 停止并 join；
-6. C 提取结果，reset/destroy WorkerLoop、释放 local snapshot，注销 epoch 并通知 B；
+6. C 提取结果，reset/destroy WorkerLoop、释放 local snapshot，注销 epoch 并通知 B；C 执行线程此后即可 join，但 DNS-owned `WorkerSupervisor`/`WorkerRecord` registry 继续存活；
 7. B 使所有已经 commit 的 cohort 完成 grace period；
 8. A 完成这些 committed update 的 future，结果为 success；
 9. A 在 publication mutex 下将 active slot exchange 为 null，把最后一个 active owner 放进 init 时已预留、独立于普通 retirement credit 的 terminal owner record 并转交 B；
 10. join A；
 11. B 在线程 B 上析构全部 retired 和最终 active snapshot，然后 join B；
-12. join C；C 对象及稳定 WorkerRecord registry 必须活到 B 不再扫描之后，cache/registry 也在此后才销毁；
+12. B 不再扫描后才销毁 `WorkerSupervisor` 对象、稳定 WorkerRecord registry 和 cache；这里要求最后存活的是 registry owner，不要求已经完成 drain 的 C 执行线程最后 join；
 13. 根据 first-wins stop cause 落到 `Stopped` 或 `Failed`。
 
 若运行期更新关闭、A/B 不存在，则在全部 worker join 并释放本地 owner 后，由 DNS 的 teardown owner 析构静态 active snapshot。任何未 join 的 worker 都不能从 grace-period 谓词中排除；若它永久不可 join，资源宁可保留到外部终止进程，也不能冒险 UAF。
 
-阶段 12 是一个明确的过渡版本：`runtime_updates_enabled=true` 时已有 A、尚无 B/cohort。该阶段关闭 admission 并让 A seal/取消未提交工作后，先 join A 以冻结 shared_ptr publication，再由 C stop/join/reset workers，最后由 DNS teardown owner 释放 active shared_ptr。A/C 故障也遵守“先 join 故障 writer，再接管并释放 owner”。阶段 13 引入 B 后立即用上述完整顺序替换这一过渡协议，不能把“有 A、无 B”误套到另外两条分支。
+阶段 12 曾使用“有 A、无 B/cohort”的过渡停机路径；阶段 13 已删除该路径。当前 `runtime_updates_enabled=true` 必须使用上述 A/B/C 完整顺序，`false` 才允许在全部 worker join/reset 后由 DNS teardown owner 析构静态 active snapshot。
 
 ### 5.6 控制角色故障时的 emergency takeover
 
 第 5.5 节是 A/B/C 均存活的正常路径。任一角色意外退出后，`ServiceStopController` 先让其他仍存活角色进入 role-specific fatal drain；调用 `join()` 的外部线程成为 teardown coordinator，但只有在 join 对应故障线程、证明旧 writer 不再运行后，才能接管它的职责。所有接管所需的 owner、journal、promise state 和 WorkerRecord 都位于 DNS-owned `ControlPlaneState`，不依赖故障线程栈展开。
 
-- **A 故障**：先 join A，再取得 publication mutex，根据稳定 publication journal 区分未提交命令和已提交 generation，冻结 publication。未提交命令明确失败；已提交 retirement record 继续等待原 cohort。teardown coordinator 成为 publication successor，负责在 cohort 收敛后完成 committed future，并在锁内执行最终 `active.exchange(nullptr)`，把 owner 写入预留 terminal record。
-- **B 故障、A 仍存活**：retired/terminal strong owner 始终存放在 ControlPlaneState 的稳定队列，B 栈展开不得释放它们。先 join B，再让 C 或其 successor join/reset 全部 worker；teardown coordinator 代替 B 判定固定 cohort 收敛并通知仍存活、处于 fatal-drain 的 A。A 完成 committed future，在 publication mutex 下执行 terminal `active.exchange(nullptr)`，随后退出；外部线程 join A 后，coordinator 才在 emergency teardown 线程上析构 stable retired/terminal owner。正常路径的“只在 B 析构”在 B 已死亡时允许这一受控例外。
-- **A、B 都故障**：先 join A/B 并冻结 publication，再由 C 或其 successor stop/join/reset 所有 worker；随后 teardown coordinator 作为 publication successor 完成 committed state、执行 terminal exchange，最后才析构 stable records。
+- **A 故障**：先 seal publication，并由 C 或其 successor stop/join/reset worker；A 可以在 C drain 前后 join，但 teardown coordinator 只有在 A 已 join、证明旧 writer 不再运行后，才能根据稳定 publication journal 区分未提交命令和已提交 generation并接管。未提交命令明确失败；已提交 retirement record 继续等待原 cohort，收敛后由 successor 完成 committed future，再执行最终 `active.exchange(nullptr)`，把 owner 写入预留 terminal record。
+- **B 故障、A 仍存活**：retired/terminal strong owner 始终存放在 ControlPlaneState 的稳定队列，B 栈展开不得释放它们。C 或其 successor 先 stop/join/reset 全部 worker以证明 cohort；B 可以在该 drain 前后 join，但 emergency reclaimer 只有在 B 已 join且 publication 已 seal 后才能接管。它判定固定 cohort 收敛并通知仍存活、处于 fatal-drain 的 A；A 完成 committed future并执行 terminal exchange。外部线程 join A 后，coordinator 才在 emergency teardown 线程上析构 stable retired/terminal owner。正常路径的“只在 B 析构”在 B 已死亡时允许这一受控例外。
+- **A、B 都故障**：先冻结 publication并由 C 或其 successor stop/join/reset所有 worker；A/B 可以更早 join，但各自的唯一写者职责只能在对应线程已 join 后接管。随后 teardown coordinator 完成 committed state、执行 terminal exchange，最后才析构 stable records。
 - **C 故障**：每个 WorkerRecord 的 stop endpoint、thread handle 和 owner 仍然稳定可达。先 join C，随后 teardown coordinator 成为唯一 WorkerRecord writer，遍历 exact instance，发 stop、join、提取结果、reset WorkerLoop、release snapshot，并 release-store `quiesced_through_instance_id`/推进 progress 以帮助 B 收敛。
 - **多角色同时故障**：先冻结 admission/restart/publication，再 join 所有已故障角色；按“停止并 join worker → release worker-local snapshot → 处理 committed cohort → detach active → 析构 owner”的所有权顺序接管，绝不能按线程编号机械 join。
 
 A/B/C 顶层 catch 必须进入 `noexcept` fatal epilogue：发布 exact role result，调用 `fail_service()`，唤醒 `join()`/waiter 后返回。它不能自行执行全局 join。可执行程序平时应阻塞等待“显式 stop 或 fatal teardown request”，收到后立即调用 `join()` 驱动正常/emergency 收尾，而不是等到终态 Failed 才开始 join。阶段 15 若改用 raw pointer，所有 `unique_ptr` owner 仍必须在 ControlPlaneState 的稳定 registry 中，尤其不能因 B 的栈展开而提前析构。
 
-emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退出；遇到永久不可 join worker 时停在 `Stopping/Unavailable`，保留所有可能仍被借用的 owner，等待部署 watchdog 超时 kill。
+emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退出；遇到永久不可 join worker 时停在 `Stopping/Unavailable`，保留所有可能仍被借用的 owner，等待部署 watchdog 超时 kill。显式 `join()` 会返回 `TeardownIncomplete` 供调用者重试；若调用者直接析构仍处于该状态的 `DNS`，析构必须 fail-fast/terminate，不能继续普通成员析构而释放尚未证明安全的 owner。
 
 ## 6. 分阶段实施顺序
 
@@ -513,6 +513,8 @@ emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退
 
 目标：把快照切换、提交 future、worker 生命周期和回收证明连成完整协议，同时保留 `shared_ptr` 安全网。
 
+状态：已完成。实现以 DNS-owned `FilterPublicationState` 保存 active slot、稳定 registry、普通/terminal retirement record、progress sequence 和 emergency takeover 所需 owner；`FilterUpdateController` 不再暴露 owning `snapshot()`/`snapshot_slot()` API。
+
 实施内容：
 
 - 每个 worker 持有本地 snapshot 和 cache-line 隔离的 observed generation；请求热路径不再 atomic-load shared_ptr；
@@ -538,9 +540,9 @@ emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退
 - stop 分别命中 build 前、commit 前、exchange 后、等待 cohort 时；
 - 高频更新与持续查询下 generation 单调、过滤行为一致；
 - lost-wake、虚假唤醒、B 启动/runtime fatal、A/C fatal 接管、retirement/terminal record 和内存上限；
-- 从本阶段开始增加 TSan 配置并运行并发测试。
+- 从本阶段开始增加 TSan 配置；本机直接启动受 GCC TSan `unexpected memory mapping` 限制，使用 `setarch x86_64 -R` 后 generation/filter-reload/lifecycle/reactor 并发测试已通过，完整矩阵仍由原生兼容的 CI 环境复跑。
 
-验收：热路径没有 per-request shared_ptr 原子加载/引用计数；旧树不在 worker 析构；ASan/UBSan/TSan 长压测无 UAF/data race；停止顺序可证明无循环等待。
+验收：热路径没有 per-request shared_ptr 原子加载/引用计数；旧树不在 worker 析构；ASan/UBSan 已通过，TSan 在兼容地址空间运行时无 data race（直接 preset 在本宿主受 runtime 映射限制）；停止顺序可证明无循环等待。
 
 ### 阶段 14：WorkerSupervisor 运行期恢复与 degraded 健康状态
 
