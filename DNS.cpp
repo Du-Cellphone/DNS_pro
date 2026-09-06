@@ -94,6 +94,23 @@ DNSFatalError make_role_fatal(DNSFatalCode code, DNSControlRole role) noexcept
     return error;
 }
 
+DNSFatalError map_worker_failure(const dns::server::WorkerFailure &failure) noexcept
+{
+    DNSFatalError error;
+    error.code                = failure.budget_exhausted                                         ? DNSFatalCode::RestartBudgetExhausted
+                                : failure.code == dns::server::WorkerFailureCode::JoinFailed     ? DNSFatalCode::WorkerJoinFailed
+                                : failure.code == dns::server::WorkerFailureCode::UnexpectedStop ? DNSFatalCode::UnexpectedWorkerStop
+                                                                                                 : DNSFatalCode::WorkerExited;
+    error.role                = DNSControlRole::Worker;
+    error.worker_id           = failure.worker_id;
+    error.instance_id         = failure.instance_id;
+    error.worker_error        = failure.runtime_error;
+    error.worker_create_error = failure.create_error;
+    error.worker_failure_code = failure.code;
+    error.error_number        = failure.error_number;
+    return error;
+}
+
 } // namespace
 
 struct DNS::ControlPlaneState final : dns::server::FilterRunnerObserver, dns::server::SnapshotReclaimerObserver
@@ -214,9 +231,9 @@ bool DNS::init(const DNSConfig &config)
         init_in_progress_ = true;
     }
 
-    const bool restart_config_valid = config.worker_failure_policy == WorkerFailurePolicy::FailService ||
-                                      (config.restart_max_attempts != 0 && config.restart_initial_backoff.count() >= 0 &&
-                                       config.restart_max_backoff >= config.restart_initial_backoff && config.restart_stability_window.count() >= 0);
+    const dns::server::WorkerRecoveryConfig recovery{config.worker_failure_policy, config.restart_max_attempts, config.restart_initial_backoff,
+                                                     config.restart_max_backoff, config.restart_stability_window};
+    const bool                              restart_config_valid = dns::server::is_valid_recovery_config(recovery);
     const bool valid = config.worker_count != 0 && dns::server::is_valid_upstream_config(config.upstream) && restart_config_valid;
     if (!valid)
     {
@@ -248,16 +265,12 @@ bool DNS::init(const DNSConfig &config)
 
         std::scoped_lock lock{lifecycle_mutex_};
         config_ = RuntimeConfig{
-            .worker_count             = config.worker_count,
-            .cache_capacity           = config.cache_capacity,
-            .port                     = config.port,
-            .runtime_updates_enabled  = config.runtime_updates_enabled,
-            .worker_failure_policy    = config.worker_failure_policy,
-            .restart_max_attempts     = config.restart_max_attempts,
-            .restart_initial_backoff  = config.restart_initial_backoff,
-            .restart_max_backoff      = config.restart_max_backoff,
-            .restart_stability_window = config.restart_stability_window,
-            .upstream                 = config.upstream,
+            .worker_count            = config.worker_count,
+            .cache_capacity          = config.cache_capacity,
+            .port                    = config.port,
+            .runtime_updates_enabled = config.runtime_updates_enabled,
+            .recovery                = recovery,
+            .upstream                = config.upstream,
         };
         health_ = DNSHealthSnapshot{
             .state                = DNSHealthState::Unavailable,
@@ -343,20 +356,34 @@ DNSStartResult DNS::start()
             .cache                  = cache_.get(),
             .filter_publication     = &control_->publication,
             .upstream               = config_.upstream,
+            .recovery               = config_.recovery,
+            .service_stop_token     = startup_stop_source_.get_token(),
             .fault_hooks            = faults_->supervisor,
             .fatal_reporter_context = this,
-            .fatal_reporter =
-                [](void *context, size_t worker_id, uint64_t instance_id, const dns::server::WorkerRunResult &result) noexcept
+            .fatal_reporter         = [](void *context, const dns::server::WorkerFailure &failure) noexcept
+            { static_cast<DNS *>(context)->fail_service(map_worker_failure(failure)); },
+            .health_reporter =
+                [](void *context, const dns::server::SupervisorHealthSnapshot &snapshot) noexcept
             {
-                auto         *service = static_cast<DNS *>(context);
-                DNSFatalError error;
-                error.code =
-                    result.outcome == dns::server::WorkerRunOutcome::RequestedStop ? DNSFatalCode::UnexpectedWorkerStop : DNSFatalCode::WorkerExited;
-                error.role         = DNSControlRole::Worker;
-                error.worker_id    = worker_id;
-                error.instance_id  = instance_id;
-                error.worker_error = result.error;
-                service->fail_service(std::move(error));
+                auto            *service = static_cast<DNS *>(context);
+                std::scoped_lock lock{service->lifecycle_mutex_};
+                if (service->state_ != DNSLifecycleState::Active && service->state_ != DNSLifecycleState::Stopping)
+                    return;
+                auto &health                 = service->health_;
+                health.restart_count         = snapshot.restart_count;
+                health.restart_success_count = snapshot.restart_success_count;
+                health.restart_failure_count = snapshot.restart_failure_count;
+                // Counters still drain after stop. A late C snapshot must
+                // never restore availability or overwrite the first fatal.
+                if (service->state_ != DNSLifecycleState::Active || service->stop_cause_ != StopCause::None)
+                    return;
+                health.available_workers = snapshot.available_workers;
+                health.state             = snapshot.available_workers == health.desired_workers ? DNSHealthState::Healthy
+                                           : snapshot.available_workers == 0                    ? DNSHealthState::Unavailable
+                                                                                                : DNSHealthState::Degraded;
+                if (snapshot.last_error)
+                    health.last_error = map_worker_failure(*snapshot.last_error);
+                service->lifecycle_changed_.notify_all();
             },
         };
         auto             supervisor = std::make_unique<dns::server::WorkerSupervisor>(std::move(supervisor_config));

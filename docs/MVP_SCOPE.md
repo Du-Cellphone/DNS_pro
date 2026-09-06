@@ -87,7 +87,10 @@ canonical QNAME + QTYPE + QCLASS
 - 响应、超时、取消和网络错误只能有一个成为等待操作的最终完成原因。
 - coroutine frame、文件描述符、定时器和 pending query 必须具有明确且可测试的 owner。
 - 过滤规则在控制面完整构建后，以不可变快照形式原子发布；A 只向 C 发送 generation 事件，C 用独立 eventfd 唤醒空闲 worker。Ready/activation/data-plane gate 同样能返回 Refresh 动作，避免 Starting participant 因尚未进入 epoll 而阻塞 grace period。
-- 初始启动是 all-or-nothing；B、A、C 和全部 worker Ready 后，worker 依次通过 activation gate 并停在 data-plane gate，服务提交 Active 前不能处理数据报。阶段 13 仍将运行期 worker 意外退出升级为完整服务失败；配置化的进程内重启在阶段 14 启用。
+- 初始启动是 all-or-nothing；B、A、C 和全部 worker Ready 后，worker 依次通过 activation gate 并停在 data-plane gate，服务提交 Active 前不能处理数据报。运行期默认 `FailService`；配置 `Restart` 后，仅 Active 中的 worker 异常可以打开恢复周期。启动失败和 A/B/C 故障始终终止整个服务。
+- C 先 join 旧实例、提取结果和统计、reset WorkerLoop 并发布 quiescence，才可复用 cache shard；新实例重新获得 stop source、单调 instance id 和独立 Ready/Activate gate。worker 在上报 completion 前关闭 listener，退出 `SO_REUSEPORT` 组；replacement 始终绑定首次启动冻结的端口，bind 失败消耗恢复预算。
+- 同一 logical worker 的恢复周期最多准入 `restart_max_attempts` 次 replacement 创建；create/thread/init/bind 失败及短暂 Running 后再次退出都消耗同一预算。退避按 initial、2×initial、4×initial 增长并封顶于 max，C 的 deadline 等待可被 stop、generation 和其他 worker 事件唤醒。只有连续 Running 满 stability window 才重置该周期的预算和退避，累计计数不清零。
+- 健康状态由 C 发布值快照：全部 worker Running 为 Healthy，部分可用为 Degraded，全部暂时离线为 Unavailable；三者都可能处于生命周期 Active。health 同时报告可用/目标 worker 数、累计尝试/激活/失败计数和最近 exact-instance 错误。stop 关闭恢复准入，迟到健康通知只能更新累计计数，不能恢复可用状态或覆盖 first-wins fatal。
 - 正常停止先 seal publication，再由 C join/reset worker，随后完成 committed cohort；C 执行线程可以在 drain 后先 join，但 DNS-owned WorkerRecord registry 必须继续存活。A detach terminal owner 后退出，B 析构所有 stable owner，最后才销毁 registry。A/B/C 任一故障时，外部 teardown coordinator 只有在 join 对应的原唯一 writer 后才能接管，并且仍须用 exact ack/quiescence 证明安全；若 DNS 析构时仍无法证明所有 worker 已 join，则 fail-fast而不能冒险释放 owner。
 
 ## 第一版明确不支持

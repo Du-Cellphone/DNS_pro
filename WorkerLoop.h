@@ -76,6 +76,7 @@ enum class WorkerRuntimeStep : uint8_t
     RuntimeInvariant,
     UnhandledException,
     Shutdown,
+    UnexpectedStop,
 };
 
 struct WorkerRuntimeError

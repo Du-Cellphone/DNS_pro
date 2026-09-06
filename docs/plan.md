@@ -2,7 +2,7 @@
 
 本文档从阶段 10 完成后的代码状态出发，统一记录已经确认的产品边界、控制面架构、快照生命周期、worker 恢复语义和后续实施顺序。后续若改变这里的协议或生命周期契约，必须在同一阶段同步修改本文档、`docs/MVP_SCOPE.md` 和对应测试。
 
-当前实施状态：阶段 13 的 worker-local snapshot、generation 安全点、精确 publication cohort、一个普通 retirement credit、独立 terminal record、专用回收线程 B 以及 A/B/C 正常/故障停机协议已经完成，下一阶段为阶段 14 的可配置 worker 恢复与 degraded 健康状态。规则输入现在有 100,000 条/16 MiB 单命令硬上限、64 MiB 排队字节上限，grace stall 默认 30 秒且只触发诊断性 fatal、绝不强制回收。本地默认/严格 socket、ASan 和 UBSan 矩阵已覆盖 12 个 CTest target；TSan target 可以构建，但该宿主直接启动 GCC TSan 时会在进入测试逻辑前报 `unexpected memory mapping`。使用 `setarch x86_64 -R` 后，generation、filter-reload、lifecycle 和含持续 UDP 查询的 reactor 测试均已通过且无 TSan 报告；完整 preset 仍应在原生兼容的 CI 地址空间复跑。本地仍缺少 `clang++` 和 `dig`，因此 libFuzzer target 的实际构建运行及 `dig +noedns` 手工验收也须在具备这些工具的 CI/主机补跑；等价的通用 parser/service-boundary target、raw OPT 首包和 A/AAAA UDP 转发回归已经纳入代码库。
+当前实施状态：阶段 14 的可配置 worker 恢复、指数退避/恢复预算/稳定窗口、独立 replacement 握手、Healthy/Degraded/Unavailable 健康状态和冻结端口恢复已完成，下一阶段为阶段 15 的快照所有权性能门。默认、严格 socket、ASan、UBSan 完整矩阵均已通过全部 13 个 CTest target；使用 `setarch x86_64 -R ctest --preset tsan` 后完整 TSan 矩阵也已通过 13/13，未报告 data race。宿主机直接启动 GCC TSan 仍在进入测试前报 `unexpected memory mapping`。新增配置、计数和外部 watchdog 边界见 `docs/OPERATIONS.md`。阶段 13 的规则/队列硬上限和 30 秒诊断性 grace timeout 保持不变，绝不强制回收。libFuzzer 实际运行及 `dig +noedns` 手工验收仍属于前序未完成的工具验收，本阶段未补跑；通用 parser/service-boundary、raw OPT 和 A/AAAA UDP 回归继续纳入完整矩阵。
 
 ## 1. 已确认的决策
 
@@ -45,7 +45,7 @@ inline constexpr auto kDownstreamResponseBudget    = kClassicDnsUdpPayloadLimit;
 
 1. 启动是 all-or-nothing。只要任一 worker 或必需的控制面线程初始化失败，`DNS::start()` 就回滚整个启动尝试并返回结构化错误。
 2. DNS 库本身不调用 `std::exit()`；可执行程序的 `main` 收到启动失败后打印原因并以非零状态退出。这满足“启动期任一 worker 失败即退出程序”，又保持库 API 可测试。
-3. worker 自动恢复只适用于服务已经进入 `Active` 后发生的运行期 fatal exit，并由显式配置决定。阶段 12/13 以 `FailService` 作为唯一实际行为；阶段 14 才启用可选的 `Restart`：
+3. worker 自动恢复只适用于服务已经进入 `Active` 后发生的运行期 fatal exit，并由显式配置决定。阶段 14 已启用可选的 `Restart`，默认仍为 `FailService`：
 
 ```text
 worker_failure_policy = Restart | FailService
@@ -315,7 +315,7 @@ Lifecycle: Empty | Initialized | Starting | Active | Stopping | Stopped | Failed
 Health:    Healthy | Degraded | Unavailable
 ```
 
-`is_running()` 只表示 lifecycle 为 `Active`，即使健康状态暂时为 `Degraded`。health snapshot 另外报告可用 worker 数、目标 worker 数、restart 计数、最近错误、filter generation 和初次启动确定的 `effective_bound_port`。
+`is_running()` 只表示 lifecycle 为 `Active`。全部 worker Running 时 health 为 `Healthy`，部分可用时为 `Degraded`，全部处于恢复过程时可暂时为 `Unavailable`，但生命周期仍是 `Active`。health snapshot 另外报告可用 worker 数、目标 worker 数、累计 restart 尝试/激活/失败计数、最近错误、filter generation 和初次启动确定的 `effective_bound_port`；恢复 Healthy 不抹去最近错误，也不重置累计计数。
 
 若 fatal teardown 能完整 join 和回收，最终 health/lifecycle 为 `Unavailable/Failed`。若存在不可 join 线程，生命周期不能谎称清理完成，而是保持 `Stopping/Unavailable`；fatal reason 会唤醒正在等待的 `DNS::join()`/`wait()`。可执行程序在观察到最终 Failed 时非零退出；若 join 超过部署 watchdog 的期限，则由 watchdog 强制终止进程后重启。
 
@@ -407,6 +407,10 @@ AND retry budget is not exhausted
 
 只有初始 start 的 create/init/bind 失败是 StartupFailure，绝不打开 recovery episode。replacement Ready 后先 Activate；只有连续稳定运行达到 `restart_stability_window` 才清零该 logical worker 的连续失败预算，避免快速反复崩溃靠每次短暂 Ready 无限重置。
 
+`restart_max_attempts` 精确定义为同一恢复周期中准入的 replacement 创建次数，不包含最初失败的初始实例。该周期内 replacement 激活后再次早夭并不赠送新的预算；C 使用 completion 时间判断稳定窗口，不能因为处理通知较晚就把早夭算成稳定。首次退避是 initial，后续依次翻倍至 max，持续稳定后重新从 initial 开始。时间点和退避运算饱和处理，极大合法时长不会整数溢出。`restart_count` 统计累计准入尝试，`restart_success_count` 统计进入 Running，`restart_failure_count` 统计 replacement 创建/启动失败或其随后异常退出；一次 replacement 可以先成功激活、后来失败，因此这三者不是分区求和关系。
+
+每个新实例在 C 的 mutex 下重新创建 stop source 和 exact-instance ready/completion/gate slots；外部停止请求在同一 mutex 下复制 stop source，再在锁外触发回调。恢复准入同时检查 DNS 的全局 stop token，因此不能把新 source 安装到一个已经停止的服务。C 的 replacement Ready/Activate 等待和 backoff 都集成在同一个可唤醒事件循环里；等待一个 replacement 不阻止处理其他 worker 的退出和 publication。
+
 若 Active 中的 `run()` 在 C 未请求 stop 时返回 `RequestedStop`，C 将它规范化为 `FatalExit(UnexpectedStop)`；全局正常 stop 必须先走 Running→Stopping，不能被 restart/fail-service 逻辑误判。
 
 新实例先读取并安装 current generation，完成 participant 注册和二次校验后才能 Ready，再由 C Activate。`port=0` 的首次启动值只在 Active commit 时冻结在 immutable service/health snapshot 中；replacement worker 始终尝试绑定该 `effective_bound_port`，不能再次请求随机端口。当前“listener 随 WorkerLoop 关闭”的架构无法保证 backoff 期间端口不被其他进程抢占，因此 bind 失败是一次明确的恢复失败，计入预算，最终可触发 FailService，而不是偷偷换端口。即使当前健康状态为 Degraded/Unavailable，`bound_port()` 仍报告冻结端口；只有初始启动回滚才丢弃 `attempt_bound_port`。
@@ -445,7 +449,7 @@ AND retry budget is not exhausted
 
 A/B/C 顶层 catch 必须进入 `noexcept` fatal epilogue：发布 exact role result，调用 `fail_service()`，唤醒 `join()`/waiter 后返回。它不能自行执行全局 join。可执行程序平时应阻塞等待“显式 stop 或 fatal teardown request”，收到后立即调用 `join()` 驱动正常/emergency 收尾，而不是等到终态 Failed 才开始 join。阶段 15 若改用 raw pointer，所有 `unique_ptr` owner 仍必须在 ControlPlaneState 的稳定 registry 中，尤其不能因 B 的栈展开而提前析构。
 
-emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退出；遇到永久不可 join worker 时停在 `Stopping/Unavailable`，保留所有可能仍被借用的 owner，等待部署 watchdog 超时 kill。显式 `join()` 会返回 `TeardownIncomplete` 供调用者重试；若调用者直接析构仍处于该状态的 `DNS`，析构必须 fail-fast/terminate，不能继续普通成员析构而释放尚未证明安全的 owner。
+emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退出；fatal teardown 遇到永久不可 join worker 时保持 `Stopping/Unavailable`，保留所有可能仍被借用的 owner，等待部署 watchdog 超时 kill。若 join 操作返回但未能证明清理完成，显式 `join()` 返回 `TeardownIncomplete` 供调用者重试；`std::jthread::join()` 本身没有硬超时，永久挂起的线程也可能使该调用一直等待，外部 watchdog 必须独立检测。若调用者直接析构仍处于 `TeardownIncomplete` 状态的 `DNS`，析构必须 fail-fast/terminate，不能继续普通成员析构而释放尚未证明安全的 owner。
 
 ## 6. 分阶段实施顺序
 
@@ -547,6 +551,8 @@ emergency teardown 能完整收尾时最终进入 `Failed` 并使 main 非零退
 ### 阶段 14：WorkerSupervisor 运行期恢复与 degraded 健康状态
 
 目标：在阶段 12/13 的 instance 和 cohort 协议上实现可配置的运行期恢复。
+
+状态：已完成。实现接入 C 的可唤醒 deadline 事件循环，使用每实例独立的 Ready/Activate/data-plane gate；配置和运维契约见 `docs/OPERATIONS.md`。新增 `dns_recovery_tests` 覆盖恢复、停止交错、冻结端口、快照换代及 C 延迟观察 completion 的稳定窗口边界。默认/严格 socket/ASan/UBSan/TSan（使用兼容地址空间）均已通过全部 13 项 CTest，阶段 12/13 回归继续通过。
 
 实施内容：
 

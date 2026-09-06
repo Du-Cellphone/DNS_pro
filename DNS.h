@@ -3,6 +3,7 @@
 #include "DNS_Cache.h"
 #include "FilterUpdateController.h"
 #include "WorkerLoop.h"
+#include "WorkerRecovery.h"
 #include "common/Expected.h"
 
 #include <chrono>
@@ -23,12 +24,6 @@ namespace dns::server
 class WorkerSupervisor;
 }
 
-enum class WorkerFailurePolicy
-{
-    FailService,
-    Restart,
-};
-
 struct DNSConfig
 {
     size_t   worker_count{1};
@@ -36,8 +31,8 @@ struct DNSConfig
     uint16_t port{5353};
     bool     runtime_updates_enabled{true};
 
-    // Stage 13 stores the recovery policy, but every runtime worker failure
-    // still fails the complete service. Restart is activated in stage 14.
+    // Initial startup is all-or-nothing. These settings govern
+    // replacement attempts only after the service becomes Active.
     WorkerFailurePolicy       worker_failure_policy{WorkerFailurePolicy::FailService};
     size_t                    restart_max_attempts{3};
     std::chrono::milliseconds restart_initial_backoff{100};
@@ -135,6 +130,8 @@ enum class DNSFatalCode
     SupervisorExited,
     WorkerExited,
     UnexpectedWorkerStop,
+    RestartBudgetExhausted,
+    WorkerJoinFailed,
     InternalError,
 };
 
@@ -145,12 +142,17 @@ struct DNSFatalError
     size_t                                                    worker_id{std::numeric_limits<size_t>::max()};
     uint64_t                                                  instance_id{0};
     std::optional<dns::server::WorkerRuntimeError>            worker_error;
+    std::optional<dns::server::WorkerInitError>               worker_create_error;
+    std::optional<dns::server::WorkerFailureCode>             worker_failure_code;
+    int                                                       error_number{0};
     std::shared_ptr<const dns::server::FilterGraceDiagnostic> grace_diagnostic;
 
     bool operator==(const DNSFatalError &other) const
     {
         return code == other.code && role == other.role && worker_id == other.worker_id && instance_id == other.instance_id &&
-               worker_error == other.worker_error && static_cast<bool>(grace_diagnostic) == static_cast<bool>(other.grace_diagnostic) &&
+               worker_error == other.worker_error && worker_create_error == other.worker_create_error &&
+               worker_failure_code == other.worker_failure_code && error_number == other.error_number &&
+               static_cast<bool>(grace_diagnostic) == static_cast<bool>(other.grace_diagnostic) &&
                (!grace_diagnostic || *grace_diagnostic == *other.grace_diagnostic);
     }
 };
@@ -170,6 +172,8 @@ struct DNSHealthSnapshot
     size_t                                    available_workers{0};
     size_t                                    desired_workers{0};
     uint64_t                                  restart_count{0};
+    uint64_t                                  restart_success_count{0};
+    uint64_t                                  restart_failure_count{0};
     std::optional<uint16_t>                   effective_bound_port;
     std::optional<dns::server::FilterVersion> filter_version;
     std::optional<DNSFatalError>              last_error;
@@ -216,16 +220,12 @@ private:
 
     struct RuntimeConfig
     {
-        size_t                      worker_count{1};
-        size_t                      cache_capacity{Cache::DEFAULT_TOTAL_CAPACITY};
-        uint16_t                    port{5353};
-        bool                        runtime_updates_enabled{true};
-        WorkerFailurePolicy         worker_failure_policy{WorkerFailurePolicy::FailService};
-        size_t                      restart_max_attempts{3};
-        std::chrono::milliseconds   restart_initial_backoff{100};
-        std::chrono::milliseconds   restart_max_backoff{5'000};
-        std::chrono::milliseconds   restart_stability_window{30'000};
-        dns::server::UpstreamConfig upstream{};
+        size_t                            worker_count{1};
+        size_t                            cache_capacity{Cache::DEFAULT_TOTAL_CAPACITY};
+        uint16_t                          port{5353};
+        bool                              runtime_updates_enabled{true};
+        dns::server::WorkerRecoveryConfig recovery{};
+        dns::server::UpstreamConfig       upstream{};
     };
 
     struct ControlPlaneState;

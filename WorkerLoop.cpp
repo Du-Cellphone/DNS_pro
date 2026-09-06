@@ -464,6 +464,10 @@ WorkerRunResult WorkerLoop::run(std::stop_token thread_stop_token, WorkerRunObse
     // Every path, including partial initialization and observer failure, joins
     // here. Keeping cleanup outside the branches prevents double cancellation
     // and ensures borrowed timer/upstream nodes are released before return.
+    // An exited instance must leave the SO_REUSEPORT group before completion
+    // is reported; otherwise clients can be routed to a dead listener while
+    // C observes the failure and schedules recovery.
+    listen_fd_.reset();
     const bool shutdown_clean = shutdown_runtime();
     capture_runtime_stats();
 

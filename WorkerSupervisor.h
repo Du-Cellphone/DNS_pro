@@ -3,6 +3,7 @@
 #include "DNS_Cache.h"
 #include "FilterPublication.h"
 #include "WorkerLoop.h"
+#include "WorkerRecovery.h"
 #include "common/Expected.h"
 
 #include <atomic>
@@ -32,6 +33,7 @@ enum class WorkerRecordState : uint8_t
     Stopping,
     Exited,
     Joined,
+    Backoff,
 };
 
 enum class SupervisorStartupErrorCode : uint8_t
@@ -100,6 +102,7 @@ enum class SupervisorRunErrorCode : uint8_t
     AlreadyRunning,
     UnexpectedWorkerStop,
     WorkerFatalExit,
+    WorkerJoinFailed,
     InternalError,
 };
 
@@ -116,11 +119,43 @@ struct SupervisorRunResult final
     bool operator==(const SupervisorRunResult &) const = default;
 };
 
+struct WorkerFailure final
+{
+    WorkerFailureCode                 code{WorkerFailureCode::FatalExit};
+    size_t                            worker_id{kInvalidWorkerId};
+    uint64_t                          instance_id{0};
+    int                               error_number{0};
+    std::optional<WorkerInitError>    create_error;
+    std::optional<WorkerRuntimeError> runtime_error;
+    bool                              budget_exhausted{false};
+
+    bool operator==(const WorkerFailure &) const = default;
+};
+
+struct SupervisorHealthSnapshot final
+{
+    size_t                       available_workers{0};
+    uint64_t                     restart_count{0};
+    uint64_t                     restart_success_count{0};
+    uint64_t                     restart_failure_count{0};
+    std::optional<WorkerFailure> last_error;
+};
+
+enum class WorkerRecoveryTestPoint : uint8_t
+{
+    BeforeCreate,
+    AfterCreate,
+    Ready,
+    Activated,
+    Running,
+};
+
 // Deterministic, allocation-free fault selection used by lifecycle tests. A
 // selected runtime-init failure is injected at the Ready boundary: the worker
 // is denied activation and stopped without publishing a successful Ready.
 struct WorkerSupervisorFaultHooks final
 {
+    uint64_t          failure_from_instance{1};
     size_t            create_failure_worker{kInvalidWorkerId};
     WorkerInitStep    create_failure_step{WorkerInitStep::CreateSocket};
     int               create_failure_error{0};
@@ -129,6 +164,9 @@ struct WorkerSupervisorFaultHooks final
     size_t            runtime_init_failure_worker{kInvalidWorkerId};
     WorkerRuntimeStep runtime_init_failure_step{WorkerRuntimeStep::StartScheduler};
     int               runtime_init_failure_error{0};
+    // Optional deterministic barriers; never installed by production DNS.
+    void *recovery_probe_context{nullptr};
+    void (*recovery_probe)(void *, size_t, uint64_t, WorkerRecoveryTestPoint) noexcept {nullptr};
 };
 
 class WorkerSupervisor;
@@ -169,10 +207,10 @@ private:
 
     struct CompletionSlot final
     {
-        bool            published{false};
-        bool            stop_was_requested{false};
-        uint64_t        instance_id{0};
-        WorkerRunResult result{};
+        bool                                  published{false};
+        uint64_t                              instance_id{0};
+        WorkerRunResult                       result{};
+        std::chrono::steady_clock::time_point completed_at{};
     };
 
     explicit WorkerRecord(size_t worker_id);
@@ -186,7 +224,15 @@ private:
     ReadySlot                             ready_;
     ActivationSlot                        activated_;
     CompletionSlot                        completion_;
+    bool                                  activation_allowed_{false};
+    bool                                  data_plane_allowed_{false};
     std::optional<WorkerRunResult>        last_result_;
+    std::optional<WorkerStats>            last_stats_;
+    bool                                  recovery_episode_{false};
+    size_t                                recovery_attempts_{0};
+    std::chrono::milliseconds             next_backoff_{0};
+    std::chrono::steady_clock::time_point restart_at_{};
+    std::chrono::steady_clock::time_point stable_at_{};
     std::unique_ptr<WorkerRecordObserver> observer_;
     WorkerEpoch                           epoch_;
 };
@@ -194,7 +240,8 @@ private:
 class WorkerSupervisor final : public FilterPublicationSink
 {
 public:
-    using RuntimeFatalReporter = void (*)(void *context, size_t worker_id, uint64_t instance_id, const WorkerRunResult &result) noexcept;
+    using RuntimeFatalReporter = void (*)(void *context, const WorkerFailure &failure) noexcept;
+    using HealthReporter       = void (*)(void *context, const SupervisorHealthSnapshot &snapshot) noexcept;
 
     struct Config final
     {
@@ -203,9 +250,12 @@ public:
         Cache::DNS_Cache          *cache{nullptr};
         FilterPublicationState    *filter_publication{nullptr};
         UpstreamConfig             upstream{};
+        WorkerRecoveryConfig       recovery{};
+        std::stop_token            service_stop_token{};
         WorkerSupervisorFaultHooks fault_hooks{};
         void                      *fatal_reporter_context{nullptr};
         RuntimeFatalReporter       fatal_reporter{nullptr};
+        HealthReporter             health_reporter{nullptr};
     };
 
     explicit WorkerSupervisor(Config config);
@@ -253,9 +303,15 @@ private:
     [[nodiscard]] SupervisorRunResult                      run_impl(std::stop_token stop_token);
     [[nodiscard]] std::optional<SupervisorStartupError>    create_workers();
     [[nodiscard]] std::optional<SupervisorStartupError>    start_worker_threads();
+    [[nodiscard]] std::optional<SupervisorStartupError>    create_worker(WorkerRecord &record, uint16_t port);
+    [[nodiscard]] std::optional<SupervisorStartupError>    start_worker_thread(WorkerRecord &record);
     [[nodiscard]] std::optional<SupervisorStartupError>    await_worker_readiness();
     [[nodiscard]] std::optional<SupervisorActivationError> await_activation_command_and_workers();
     [[nodiscard]] SupervisorRunResult                      monitor_active_workers();
+    [[nodiscard]] std::optional<SupervisorRunResult>       handle_worker_failure(WorkerRecord &record, WorkerFailure failure);
+    [[nodiscard]] SupervisorRunResult                      fail_worker_service(const WorkerFailure &failure) noexcept;
+    void                                                   publish_health() noexcept;
+    void                                                   recovery_test_point(WorkerRecord &record, WorkerRecoveryTestPoint point) noexcept;
 
     void                                        worker_entry(WorkerRecord &record, uint64_t instance_id, std::stop_token thread_stop_token) noexcept;
     void                                        report_worker_ready(WorkerRecord &record, uint64_t instance_id, WorkerReadyResult result) noexcept;
@@ -275,10 +331,8 @@ private:
     [[nodiscard]] bool join_and_reset_all() noexcept;
     [[nodiscard]] bool join_and_reset(WorkerRecord &record) noexcept;
 
-    [[nodiscard]] bool          stop_requested_locked() const noexcept { return stop_requested_; }
-    [[nodiscard]] bool          has_unconsumed_completion_locked() const noexcept;
-    [[nodiscard]] WorkerRecord *first_unconsumed_completion_locked() noexcept;
-    void                        throw_if_abrupt_exit_requested();
+    [[nodiscard]] bool stop_requested_locked() const noexcept { return stop_requested_ || config_.service_stop_token.stop_requested(); }
+    void               throw_if_abrupt_exit_requested();
 
     Config                                     config_;
     std::vector<std::unique_ptr<WorkerRecord>> records_;
@@ -294,6 +348,10 @@ private:
     bool                                       abrupt_exit_after_publication_requested_{false};
     bool                                       emergency_join_failure_once_{false};
     std::optional<size_t>                      unexpected_stop_worker_;
+    uint64_t                                   unexpected_stop_instance_{0};
+    size_t                                     join_failure_worker_once_{kInvalidWorkerId};
+    uint16_t                                   effective_bound_port_{0};
+    SupervisorHealthSnapshot                   health_;
     FilterGeneration                           published_generation_{kInitialFilterGeneration};
     bool                                       snapshot_publication_pending_{false};
     std::atomic<bool>                          run_active_{false};

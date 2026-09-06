@@ -227,6 +227,10 @@ void test_init_retry_second_init_and_initialized_stop()
     require(!service.init(invalid) && service.lifecycle_state() == DNSLifecycleState::Empty,
             "Restart policy must reject a negative stability window");
 
+    invalid                       = make_config();
+    invalid.worker_failure_policy = static_cast<WorkerFailurePolicy>(99);
+    require(!service.init(invalid) && service.lifecycle_state() == DNSLifecycleState::Empty, "an unknown worker failure policy must be rejected");
+
     const DNSConfig valid = make_config();
     require(service.init(valid), "the same object must accept a corrected configuration after init failure");
     require(service.lifecycle_state() == DNSLifecycleState::Initialized &&
@@ -704,25 +708,25 @@ void test_explicit_stop_and_runtime_fatal_are_first_wins()
     }
 }
 
-void test_restart_configuration_still_fails_service_in_stage_thirteen()
+void test_fail_service_policy_preserves_worker_failure()
 {
     DNS       service;
     DNSConfig config                = make_config(1, false);
-    config.worker_failure_policy    = WorkerFailurePolicy::Restart;
+    config.worker_failure_policy    = WorkerFailurePolicy::FailService;
     config.restart_max_attempts     = 5;
     config.restart_initial_backoff  = std::chrono::milliseconds{1};
     config.restart_max_backoff      = std::chrono::milliseconds{2};
     config.restart_stability_window = std::chrono::milliseconds{10};
-    require(service.init(config), "stored Restart policy fixture must initialize");
+    require(service.init(config), "FailService policy fixture must initialize");
     const auto started = service.start();
-    require(static_cast<bool>(started), "stored Restart policy fixture must become Active");
+    require(static_cast<bool>(started), "FailService policy fixture must become Active");
 
     DNSTestPeer::stop_worker_unexpectedly(service, 0);
     const auto exit = wait_for_fatal(service, DNSFatalCode::UnexpectedWorkerStop, DNSControlRole::Worker,
                                      "an unsolicited RequestedStop must be normalized into a worker fatal");
     require(exit.fatal_error->worker_id == 0 && exit.fatal_error->instance_id == 1,
             "the worker fatal must identify the exact logical worker instance");
-    require(service.health().restart_count == 0, "stage 13 must store Restart configuration without actually launching a replacement worker");
+    require(service.health().restart_count == 0, "FailService must not launch a replacement worker");
 }
 
 } // namespace
@@ -758,7 +762,7 @@ int main()
     run("supervisor runtime fatal", test_supervisor_runtime_fatal);
     run("committed update survives A/B/C failures", test_committed_update_survives_control_role_failures);
     run("explicit stop and runtime fatal are first-wins", test_explicit_stop_and_runtime_fatal_are_first_wins);
-    run("Restart policy remains fail-service", test_restart_configuration_still_fails_service_in_stage_thirteen);
+    run("FailService policy reports exact worker failure", test_fail_service_policy_preserves_worker_failure);
     std::cout << "all lifecycle tests passed\n";
     return EXIT_SUCCESS;
 }
